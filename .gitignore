@@ -1,0 +1,6 @@
+target/
+dist*/
+dist.bak/
+
+# local-only working notes (never committed)
+secret/

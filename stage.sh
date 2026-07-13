@@ -1,0 +1,38 @@
+#!/bin/bash
+# dist 스테이징의 단일 진실 — dev(make sidecar-chromium)와 CI(release.yml)가 같은 스크립트를 쓴다.
+# 사용: stage.sh <dist-dir>   (cargo build --release 선행 전제; 이 크레이트 디렉토리에서 실행)
+set -euo pipefail
+dist="${1:?사용: stage.sh <dist-dir>}"
+src="target/release"
+
+mkdir -p "$dist"
+# dylib 은 원자적 교체(temp + mv). in-place cp 로 같은 경로를 덮어쓰면, 옛 dylib 을 이미 mmap 한
+# 프로세스가 있을 때 서명된 페이지 캐시와 새 내용이 불일치해 다른(신선) 프로세스의 dlopen 이
+# "Code Signature Invalid"(SIGKILL)로 죽는다(실측). rename 은 새 inode 를 주어 옛 매핑과 분리 →
+# 신선 프로세스는 항상 유효 서명을 본다. reach fetch(프로덕션 설치)의 원자적 install 과 동일 원칙.
+dylib_tmp="$dist/.soksak-sidecar-browser-chromium.dylib.tmp.$$"
+cp "$src/libsoksak_sidecar_browser_chromium.dylib" "$dylib_tmp"
+mv -f "$dylib_tmp" "$dist/soksak-sidecar-browser-chromium.dylib"
+
+# helper .app 변형 5종 — Chromium 은 렌더러를 " Helper (Renderer).app" 형제 번들에서 띄운다
+# (변형 부재 시 렌더러 spawn 이 조용히 실패 = 콘텐츠 blank, 실측).
+for v in "" " (Renderer)" " (GPU)" " (Plugin)" " (Alerts)"; do
+  app="$dist/soksak-sidecar-browser-chromium Helper$v.app"
+  exe="soksak-sidecar-browser-chromium Helper$v"
+  bid=$(printf '%s' "helper$v" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '.' | tr -s '.' | sed 's/\.$//')
+  mkdir -p "$app/Contents/MacOS"
+  cp "$src/soksak-sidecar-browser-chromium-helper" "$app/Contents/MacOS/$exe"
+  sed -e "s/__EXECUTABLE__/$exe/g" -e "s/__BUNDLE_ID_SUFFIX__/$bid/g" \
+    resources/HelperInfo.plist > "$app/Contents/Info.plist"
+  # cp 로 .app 안에 들어온 실행파일은 cargo 의 linker-signed adhoc 서명이 번들 문맥에서 무효가 된다
+  # ("code has no resources but signature indicates they must be present"). macOS 는 서명 무효 서브
+  # 프로세스를 SIGKILL(exit_code=9) → GPU/renderer 프로세스가 즉사해 콘텐츠 blank·앱 크래시(실측).
+  # adhoc 재서명으로 번들 문맥에 맞는 유효 서명을 부여한다(dev 스테이징 — 배포는 실 인증서로 재서명).
+  codesign --force --sign - "$app/Contents/MacOS/$exe"
+done
+
+# Chromium framework — cef 빌드 산출물(OUT_DIR)에서 심링크(아카이브는 tar -L 로 해소).
+fw=$(ls -dt "$src/build/"cef-dll-sys-*/out/cef_macos_*/"Chromium Embedded Framework.framework" 2>/dev/null | head -1)
+if [ -z "$fw" ]; then echo "framework 미발견(cef 빌드 산출물 없음)" >&2; exit 1; fi
+ln -sfn "$(cd "$(dirname "$fw")" && pwd)/Chromium Embedded Framework.framework" "$dist/Chromium Embedded Framework.framework"
+echo "스테이지 완료: $dist (helper 변형 5종)"
