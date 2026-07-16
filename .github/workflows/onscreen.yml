@@ -42,7 +42,7 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/dist
           WINIT_UNIX_BACKEND: x11
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
           SOKSAK_SIDECAR_BROWSER_CHROMIUM_NO_TICK: "0"
         run: |
           echo "== vulkan ICDs =="; ls -la /usr/share/vulkan/icd.d/ || true
