@@ -70,4 +70,38 @@ wgpu 를 끌어오지 않는다.
 - **Windows**: `presenter/windows.rs`(같은 wgpu present + HWND child 창)는 미작성.
   macOS 에서 컴파일 불가(CEF C++ 래퍼가 Windows 리소스 컴파일러 필요)라 CI 에서 작성·검증.
 - Linux/Windows CEF 적재(`libcef.{so,dll}`)는 여전히 스텁 — macOS `.framework` 경로만 배선.
-  `on_paint` CPU 폴백(shared-texture 미지원 호스트용)은 미배선(가속 경로만).
+
+Linux 는 가속(`on_accelerated_paint`→import→present)·CPU 폴백(`on_paint`→업로드→`present_cpu`)
+두 경로가 배선됨. SW GL CI(lavapipe)엔 하드웨어 DMA-BUF 가 없어 CEF 가 CPU 경로를 타므로, 그 폴백이
+CI 에서 프레임이 뜨게 하는 관건이다.
+
+## 검증 게이트
+
+| 범위 | 검증 방법 | 위치 |
+|---|---|---|
+| macOS 프로덕션 present | harness 가 페이지 렌더 — 프레임+입력(IME 포함) | 로컬(harness 실행) |
+| macOS/Linux 코드 정합 | `cargo check --target <triple>`(exit 직접 잡기) | 로컬 |
+| Windows 코드 | `cargo check`(CEF C++ 래퍼가 Windows RC 필요) | CI 전용 |
+| 온스크린 렌더(Linux/Windows) | xvfb 에서 harness 빌드·실행, 프레임 단언 | CI 전용 |
+| cross-OS 멱등 | 제어면 canonical 레코드 + per-OS 데이터면 fidelity | 구축 예정 |
+
+## 디버깅
+
+앱 없이 엔진 구동:
+
+    cargo run --release --features harness --bin harness -- <dist-dir> offscreen
+
+`make sidecar-chromium`(또는 `stage.sh <dist-dir>`)가 CEF 프레임워크·helper 번들을 스테이징한다.
+PASS(exit 0)=cefQuery 왕복 + offscreen 이면 present 경로·입력까지 성공. 프레임은
+`stats.dbg.framesPresented`, 각 프레젠터는 첫 present 를 1회 로그. 흔한 실패: macOS 는 blank=
+`Helper (Renderer).app` 변형 누락, Linux 는 프레임 0=child 창이 부모 아래 미맵 또는 CPU 폴백 미가동.
+
+## 로드맵
+
+- **A/B — 완료**: presenter 인터페이스+오라클 분리, 크레이트 게이트 해제, macOS·Linux 클린 컴파일.
+- **C/D — Linux 완료, Windows CI**: `presenter/linux.rs` 가속·CPU 폴백 두 경로 구현·클린 컴파일,
+  `presenter/windows.rs`(HWND child, 같은 wgpu 파이프라인)는 CI 에서 작성·컴파일. 온스크린은 CI xvfb.
+- **E**: Linux/Windows CEF 적재(`libcef.{so,dll}`).
+- **F**: 코어가 프레젠터에 per-OS 부모 핸들(X11 XID / HWND)을 macOS NSView 경로 옆에 넘김;
+  5타깃 릴리스 매트릭스 CI.
+- **멱등**: 제어면 canonical 투영 cross-OS 대조 + per-OS 데이터면 fidelity.

@@ -84,5 +84,47 @@ Two planes, mirroring the terminal contract (canonical projection + oracle):
   wrapper needs the Windows resource compiler — so it is authored and verified
   in CI.
 - CEF loading on Linux/Windows (`libcef.{so,dll}`) is still stubbed; only the
-  macOS `.framework` path is wired. The `on_paint` CPU fallback (for hosts
-  without shared-texture support) is not wired yet (accelerated path only).
+  macOS `.framework` path is wired.
+
+Both the accelerated (`on_accelerated_paint` → import → present) and the CPU
+fallback (`on_paint` → upload → `present_cpu`) paths are wired for Linux; on
+software-GL CI (lavapipe) CEF has no hardware DMA-BUF and takes the CPU path, so
+that fallback is what makes frames appear in CI.
+
+## Verification gates
+
+| Scope | How it is verified | Where |
+|---|---|---|
+| macOS production present | harness renders a page; frames + input (incl. IME) | local, run the harness |
+| macOS/Linux code correctness | `cargo check --target <triple>` (capture exit directly) | local |
+| Windows code | `cargo check` (its CEF C++ wrapper needs the Windows RC) | CI only |
+| On-screen render (Linux/Windows) | build + run the harness under xvfb, assert frames | CI only |
+| Cross-OS equivalence | canonical control-plane record + per-OS data-plane fidelity | to build |
+
+## Debugging
+
+Run the engine without the app:
+
+    cargo run --release --features harness --bin harness -- <dist-dir> offscreen
+
+`make sidecar-chromium` (or `stage.sh <dist-dir>`) stages the CEF framework and
+helper bundles. PASS (exit 0) means the cefQuery round-trip and, in offscreen
+mode, the present path and input all worked. Frames are exposed as
+`stats.dbg.framesPresented`; each presenter logs its first present once. Common
+failures: on macOS, blank content usually means a missing `Helper (Renderer).app`
+variant; on Linux, no frames usually means the child window was not mapped under
+the parent, or the CPU fallback is not being exercised.
+
+## Roadmap
+
+- **A/B — done**: presenter interface + oracle split; crate un-gated; macOS and
+  Linux compile clean.
+- **C/D — Linux done, Windows in CI**: `presenter/linux.rs` implements the
+  accelerated and CPU-fallback paths and compiles clean; `presenter/windows.rs`
+  (HWND child, same wgpu pipeline) is authored and compiled in CI. On-screen is
+  verified in CI under xvfb.
+- **E**: CEF library loading for Linux/Windows (`libcef.{so,dll}`).
+- **F**: the core hands the presenter a per-OS parent handle (X11 XID / HWND)
+  next to the macOS NSView path; 5-target release-matrix CI.
+- **Equivalence**: control-plane canonical projection compared across OS + a
+  per-OS data-plane fidelity check.
