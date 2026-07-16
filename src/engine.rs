@@ -644,10 +644,11 @@ fn create_offscreen(r: &CreateReq, scale: f32) {
     }
     match browser {
         Some(b) => {
-            // OSR 뷰 크기 확정 — CEF 가 RenderHandler::view_rect 를 다시 질의해 컴포지터·입력 hit-test 를
-            // 실제 크기에 맞춘다(cef-rs osr 예제 패턴). 없으면 초기 뷰 rect 가 미확정이라 windowless 입력이
-            // DOM 에 안 닿을 수 있다(Windows OSR 실측 — 프레임은 invalidate 로 뜨지만 클릭이 hit-test 를
-            // 통과 못 함). macOS·Linux 는 무해(이미 정합).
+            // OSR 뷰 크기 확정(Windows 전용) — CEF 가 RenderHandler::view_rect 를 다시 질의해 입력 hit-test
+            // 를 실제 크기에 맞춘다. 없으면 Windows windowless 입력이 미확정 뷰 rect 에 hit-test 돼 클릭이
+            // DOM 에 안 닿는다(실측: phase 1 정지). macOS·Linux 는 첫 paint 가 뷰를 확정하므로 이 호출이
+            // 오히려 입력을 깨뜨린다(실측: Linux 가 was_resized 시 phase 1 회귀) → Windows 로 한정한다.
+            #[cfg(target_os = "windows")]
             if let Some(host) = b.host() {
                 host.was_resized();
             }
@@ -887,7 +888,11 @@ fn apply_ops() {
                     let ev = KeyEvent {
                         type_,
                         modifiers: event_flags(mods),
-                        windows_key_code: code,
+                        // CEF 의 KEYEVENT_CHAR 는 Windows 에서 windows_key_code 를 "문자"로 해석한다
+                        // (macOS·Linux 는 character 필드 사용). CHAR 에 가상키 code(65='A')를 넣으면 Windows
+                        // 가 대문자 'A' 를 낸다(실측) — CHAR 는 문자코드 ch(97='a')를 넣는다. down/up 은
+                        // 가상키 code 그대로. macOS·Linux 는 character 를 쓰므로 이 구분이 무해하다.
+                        windows_key_code: if kind == 2 { ch as i32 } else { code },
                         native_key_code: 0,
                         is_system_key: 0,
                         character: ch,
