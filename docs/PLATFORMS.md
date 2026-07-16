@@ -81,9 +81,9 @@ link in CI (`.github/workflows/ci.yml`, a build-only matrix, no publish).
   runtime-verified via the harness (frames presented + input, including IME).
 - **Linux**: `presenter/linux.rs` — X11 child window under the parent XID
   (`x11-dl`), a `wgpu::Surface` on it, `osr_texture_import` → textured-quad
-  render → present — compiles and links. On-screen rendering (child window
-  mapped under the parent, frames visible) is still to be verified in CI under
-  xvfb, not by compilation.
+  render → present — is runtime-verified in CI (`onscreen.yml`): the harness
+  runs offscreen under xvfb + lavapipe, the presenter presents real frames, and
+  the full cefQuery + input (incl. IME) round-trip passes.
 - **Windows**: `presenter/windows.rs` — the same wgpu present with an HWND child
   window (`windows` crate) — compiles and links in CI. It cannot be built from
   macOS: its CEF C++ wrapper needs the Windows resource compiler, so CI is the
@@ -113,7 +113,8 @@ queue. Wiring that core-side tick is the remaining runtime step.
 | macOS production present | harness renders a page; frames + input (incl. IME) | local, run the harness |
 | All five targets compile + link | `cargo build --target <triple>` matrix (build links; check does not) | CI (`ci.yml`) |
 | macOS/Linux code correctness | `cargo check --target <triple>` (capture exit directly) | local |
-| On-screen render (Linux/Windows) | build + run the harness under xvfb, assert frames | CI, to build |
+| On-screen render (Linux) | run the harness under xvfb + lavapipe, assert frames + input | CI (`onscreen.yml`) |
+| On-screen render (Windows) | a Windows harness + message loop | CI, to build |
 | Cross-OS equivalence | canonical control-plane record + per-OS data-plane fidelity | to build |
 
 ## Debugging
@@ -141,11 +142,15 @@ the parent, or the CPU fallback is not being exercised.
 - **Phase 0 — done**: all five targets (darwin arm64/x64, linux arm64/x64,
   windows x64) compile and link in CI (`ci.yml` build matrix). The message pump
   is gated per-OS (macOS GCD, non-macOS `drive_pump` seam).
-- **On-screen — to do**: run the harness under xvfb and assert frames. The
-  current harness is macOS-only; a Linux harness (X11 parent → XID → offscreen
-  browser → assert `framesPresented`) is needed.
+- **On-screen (Linux) — done**: `onscreen.yml` builds the Linux harness, stages
+  a Linux CEF dist, and runs it under xvfb + software Vulkan (lavapipe). The
+  presenter presents real frames (`framesPresented` climbs) and the full input
+  round-trip passes — same assertion as the macOS harness. Windows on-screen is
+  still to do (a Windows harness with an HWND parent + message loop).
 - **F — to do**: the core hands the presenter a per-OS parent handle (X11 XID /
-  HWND) next to the macOS NSView path, and ticks `drive_pump` from its main loop
-  (glib idle / message-only window); 5-target release-matrix CI.
+  HWND) next to the macOS NSView path, and ticks `soksak_sidecar_engine_tick`
+  (which runs `drive_pump`) from its main loop (glib idle / message-only
+  window); 5-target release-matrix CI. The sidecar side of this tick already
+  exists and the on-screen harness drives it.
 - **Equivalence**: control-plane canonical projection compared across OS + a
   per-OS data-plane fidelity check.

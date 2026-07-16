@@ -69,8 +69,9 @@ wgpu 를 끌어오지 않는다.
 - **macOS**: 프로덕션 present(raw Metal, `presenter/macos.rs`)는 harness 런타임 검증됨
   (프레임 present + 입력, IME 포함).
 - **Linux**: `presenter/linux.rs` — 부모 XID 아래 X11 child 창(`x11-dl`), 그 위 `wgpu::Surface`,
-  `osr_texture_import` → textured-quad 렌더 → present — 컴파일·링크 통과. 온스크린(child 창이
-  부모 아래 뜨고 프레임 보임)은 CI xvfb 검증이 남았고 컴파일이 아니다.
+  `osr_texture_import` → textured-quad 렌더 → present — CI(`onscreen.yml`)에서 런타임 검증됨: harness 를
+  xvfb + lavapipe 로 오프스크린 구동하면 프레젠터가 실제 프레임을 present 하고, cefQuery + 입력(IME 포함)
+  라운드트립이 통과한다.
 - **Windows**: `presenter/windows.rs`(같은 wgpu present + HWND child 창)는 컴파일·링크 통과.
   macOS 에서 빌드 불가(CEF C++ 래퍼가 Windows 리소스 컴파일러 필요)라 CI 가 유일 경로.
   기본 target dir 이 `MAX_PATH` 를 넘어 CI 는 `CARGO_TARGET_DIR` 을 짧은 루트로 둔다.
@@ -94,7 +95,8 @@ macOS 런루프가 GCD 큐를 비우는 것과 동형이다. 그 코어측 tick 
 | macOS 프로덕션 present | harness 가 페이지 렌더 — 프레임+입력(IME 포함) | 로컬(harness 실행) |
 | 다섯 타깃 컴파일+링크 | `cargo build --target <triple>` 매트릭스(build 는 링크, check 는 아님) | CI(`ci.yml`) |
 | macOS/Linux 코드 정합 | `cargo check --target <triple>`(exit 직접 잡기) | 로컬 |
-| 온스크린 렌더(Linux/Windows) | xvfb 에서 harness 빌드·실행, 프레임 단언 | CI, 구축 예정 |
+| 온스크린 렌더(Linux) | xvfb + lavapipe 에서 harness 실행, 프레임+입력 단언 | CI(`onscreen.yml`) |
+| 온스크린 렌더(Windows) | Windows harness + 메시지 루프 | CI, 구축 예정 |
 | cross-OS 멱등 | 제어면 canonical 레코드 + per-OS 데이터면 fidelity | 구축 예정 |
 
 ## 디버깅
@@ -117,8 +119,11 @@ PASS(exit 0)=cefQuery 왕복 + offscreen 이면 present 경로·입력까지 성
   리소스 경로만 설정한다.
 - **Phase 0 — 완료**: 다섯 타깃(darwin arm64/x64·linux arm64/x64·windows x64) 전부 CI 에서
   컴파일·링크(`ci.yml` 빌드 매트릭스). 메시지 펌프는 per-OS 게이트(macOS GCD, 비-macOS `drive_pump` seam).
-- **온스크린 — 예정**: xvfb 에서 harness 실행해 프레임 단언. 현 harness 는 macOS 전용이라 Linux
-  harness(X11 부모→XID→오프스크린 브라우저→`framesPresented` 단언)가 필요하다.
+- **온스크린(Linux) — 완료**: `onscreen.yml` 이 Linux harness 를 빌드·Linux CEF dist 스테이징 후
+  xvfb + 소프트웨어 Vulkan(lavapipe)로 오프스크린 구동한다. 프레젠터가 실제 프레임을 present 하고
+  (`framesPresented` 증가) 전 입력 라운드트립이 통과 — macOS harness 와 동일 단언. Windows 온스크린은
+  예정(HWND 부모 + 메시지 루프를 쓰는 Windows harness).
 - **F — 예정**: 코어가 프레젠터에 per-OS 부모 핸들(X11 XID / HWND)을 macOS NSView 경로 옆에 넘기고,
-  메인루프에서 `drive_pump` 를 tick(glib idle / 메시지 전용 창)한다; 5타깃 릴리스 매트릭스 CI.
+  메인루프에서 `soksak_sidecar_engine_tick`(→`drive_pump`)를 tick(glib idle / 메시지 전용 창)한다;
+  5타깃 릴리스 매트릭스 CI. 이 tick 의 사이드카 쪽은 이미 있고 온스크린 harness 가 구동한다.
 - **멱등**: 제어면 canonical 투영 cross-OS 대조 + per-OS 데이터면 fidelity.
