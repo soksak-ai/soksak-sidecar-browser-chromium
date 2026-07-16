@@ -85,10 +85,15 @@ link in CI (`.github/workflows/ci.yml`, a build-only matrix, no publish).
   runs offscreen under xvfb + lavapipe, the presenter presents real frames, and
   the full cefQuery + input (incl. IME) round-trip passes.
 - **Windows**: `presenter/windows.rs` — the same wgpu present with an HWND child
-  window (`windows` crate) — compiles and links in CI. It cannot be built from
-  macOS: its CEF C++ wrapper needs the Windows resource compiler, so CI is the
-  only path. The default target dir crosses `MAX_PATH` there, so CI points
-  `CARGO_TARGET_DIR` at a short root.
+  window (`windows` crate) — compiles and links in CI, and `onscreen.yml`'s
+  windows job runs the harness (DX12 WARP software adapter): it stages a Windows
+  CEF dist, presents real frames, and passes the cefQuery round-trip. The input
+  state machine (click → focus) does not yet complete — a Windows-specific
+  windowless-input follow-up; the input forwarding itself is the same
+  platform-neutral path already runtime-verified on macOS and Linux. It cannot
+  be built from macOS (the CEF C++ wrapper needs the Windows resource compiler),
+  so CI is the only path, and the default target dir crosses `MAX_PATH` there,
+  so CI points `CARGO_TARGET_DIR` at a short root.
 - CEF is linked at build time on Linux/Windows (`cef-dll-sys` emits
   `cargo::rustc-link-lib`), so there is no runtime loader to wire — only the
   resource paths (`resources_dir_path`, `locales_dir_path`,
@@ -114,7 +119,7 @@ queue. Wiring that core-side tick is the remaining runtime step.
 | All five targets compile + link | `cargo build --target <triple>` matrix (build links; check does not) | CI (`ci.yml`) |
 | macOS/Linux code correctness | `cargo check --target <triple>` (capture exit directly) | local |
 | On-screen render (Linux) | run the harness under xvfb + lavapipe, assert frames + input | CI (`onscreen.yml`) |
-| On-screen render (Windows) | a Windows harness + message loop | CI, to build |
+| On-screen render (Windows) | run the harness (DX12/WARP), assert frames + cefQuery | CI (`onscreen.yml`, present verified; input round-trip is a follow-up) |
 | Cross-OS equivalence | canonical control-plane record + per-OS data-plane fidelity | to build |
 
 ## Debugging
@@ -145,8 +150,12 @@ the parent, or the CPU fallback is not being exercised.
 - **On-screen (Linux) — done**: `onscreen.yml` builds the Linux harness, stages
   a Linux CEF dist, and runs it under xvfb + software Vulkan (lavapipe). The
   presenter presents real frames (`framesPresented` climbs) and the full input
-  round-trip passes — same assertion as the macOS harness. Windows on-screen is
-  still to do (a Windows harness with an HWND parent + message loop).
+  round-trip passes — same assertion as the macOS harness.
+- **On-screen (Windows) — present done, input follow-up**: the same harness on
+  windows-2025 (DX12 WARP) stages a Windows dist, presents real frames, and
+  passes cefQuery. The input state machine stalls at click → focus — a
+  Windows-specific windowless-input issue tracked separately; the job is
+  `continue-on-error` so the present signal is kept without failing the workflow.
 - **F — to do**: the core hands the presenter a per-OS parent handle (X11 XID /
   HWND) next to the macOS NSView path, and ticks `soksak_sidecar_engine_tick`
   (which runs `drive_pump`) from its main loop (glib idle / message-only
