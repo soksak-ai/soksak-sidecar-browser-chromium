@@ -31,7 +31,7 @@ jobs:
             libglib2.0-dev xvfb mesa-vulkan-drivers libvulkan1 vulkan-tools \
             libnss3 libnspr4 libgbm1 libgl1-mesa-dri \
             libx11-6 libxext6 libxrender1 libxcomposite1 libxdamage1 libxrandr2 \
-            libxi6 libxtst6 libxkbcommon0 libxfixes3 \
+            libxi6 libxtst6 libxkbcommon0 libxkbcommon-x11-0 libxfixes3 libxcb1 \
             libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 \
             libpango-1.0-0 libcairo2
       - name: Build the harness and the CEF subprocess helper
