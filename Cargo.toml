@@ -48,6 +48,13 @@ objc2-foundation = "0.3"
 cef = { version = "149.3.0", default-features = false, features = ["accelerated_osr"] }
 wgpu = "29"
 raw-window-handle = "0.6"
+pollster = "0.4"      # wgpu request_adapter/request_device 는 async — present 경로에서 block_on
+bytemuck = { version = "1", features = ["derive"] }  # quad 정점 버퍼 캐스팅(예제 패턴)
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# offscreen child 창(코어 부모 XID 아래 XCreateWindow) → wgpu Surface(Vulkan VK_KHR_xlib_surface).
+# x11-dl(Xlib)은 wgpu 가 요구하는 Display*+Window 를 준다(x11rb pure-rust 는 xcb 커넥션 포인터 미노출).
+x11-dl = "2"
 
 # 독립 워크스페이스 — 코어(src-tauri) 워크스페이스와 분리(cargo 는 멤버가 루트 하위여야 해서 형제
 # 디렉토리 편입 불가). 빌드·스테이징은 make sidecar-chromium 이 소유.
