@@ -644,6 +644,13 @@ fn create_offscreen(r: &CreateReq, scale: f32) {
     }
     match browser {
         Some(b) => {
+            // OSR 뷰 크기 확정 — CEF 가 RenderHandler::view_rect 를 다시 질의해 컴포지터·입력 hit-test 를
+            // 실제 크기에 맞춘다(cef-rs osr 예제 패턴). 없으면 초기 뷰 rect 가 미확정이라 windowless 입력이
+            // DOM 에 안 닿을 수 있다(Windows OSR 실측 — 프레임은 invalidate 로 뜨지만 클릭이 hit-test 를
+            // 통과 못 함). macOS·Linux 는 무해(이미 정합).
+            if let Some(host) = b.host() {
+                host.was_resized();
+            }
             if let Ok(mut list) = BROWSERS.lock() {
                 list.push((r.id, b));
             }
