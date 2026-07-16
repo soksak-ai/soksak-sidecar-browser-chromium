@@ -31,8 +31,10 @@ if [ "$(uname -s)" = "Linux" ]; then
   find "$cefdir" -maxdepth 2 -name 'icudtl.dat' -exec cp {} "$dist/" \;
   find "$cefdir" -maxdepth 2 -name '*.pak' -exec cp {} "$dist/" \;
   find "$cefdir" -path '*/locales/*.pak' -exec cp {} "$dist/locales/" \;
-  # 서브프로세스 helper(browser_subprocess_path) + 사이드카 .so(배포 완결성; 하니스는 rlib 링크라 불요)
-  cp "$src/soksak-sidecar-browser-chromium-helper" "$dist/helper"
+  # 서브프로세스 helper — 엔진의 browser_subprocess_path 와 이름이 일치해야 한다(engine.rs:
+  # dist/soksak-sidecar-browser-chromium-helper). 다른 이름이면 CEF execvp 실패 → GPU/렌더러 서브프로세스
+  # 전멸 → "GPU process isn't usable" FATAL(실측). + 사이드카 .so(배포 완결성; 하니스는 rlib 링크라 불요).
+  cp "$src/soksak-sidecar-browser-chromium-helper" "$dist/soksak-sidecar-browser-chromium-helper"
   cp -n "$src/libsoksak_sidecar_browser_chromium.so" "$dist/soksak-sidecar-browser-chromium.so" 2>/dev/null || true
   if [ ! -e "$dist/libcef.so" ]; then echo "libcef.so 미스테이징 — 위 구조 확인" >&2; exit 1; fi
   echo "스테이지 완료(linux): $dist"
