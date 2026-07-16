@@ -28,6 +28,14 @@ use cef::*;
 
 use crate::host_emit_json;
 
+// DisplayHandler::on_cursor_change 의 cursor 핸들은 OS별 concrete 타입이고, cef 핸들러 매크로가 파라미터
+// attribute(#[cfg])를 못 받으므로 param 에 cfg 를 못 붙인다 — 대신 이 별칭을 OS별로 해소해 매크로엔 단일
+// ident 로 넘긴다. mac=*mut u8(바인딩에 CursorHandle 별칭 없음), linux=c_ulong·win=HCURSOR(cef::CursorHandle).
+#[cfg(target_os = "macos")]
+type CefCursorArg = *mut u8;
+#[cfg(not(target_os = "macos"))]
+type CefCursorArg = cef::CursorHandle;
+
 // 임베드 대기 요청(플러그인 → 커맨드 → 여기). CEF 조작은 UI(메인) 스레드에서만 하므로 큐잉 후 pump 에서 적용.
 // 좌표(x,y,w,h)는 플랫폼 중립 top-left 원점 DIP(points) — 부모 뷰 안에서. macOS 는 apply 시 y-flip.
 struct CreateReq {
@@ -377,7 +385,7 @@ fn invalidate_offscreen() {
         .map(|l| l.iter().map(|(i, b)| (*i, b.identifier())).collect())
         .unwrap_or_default();
     for (id, cid) in pairs {
-        if !crate::offscreen::is_offscreen(id) {
+        if !crate::presenter::is_offscreen(id) {
             continue;
         }
         if !(global || active.contains(&id) || loading.contains(&cid)) {
@@ -445,8 +453,9 @@ fn apply_pending() {
         }
 
         let ns_y = flip_y(parent, r.y, r.h.max(1));
+        // set_as_child 는 cef_window_handle_t(OS별: mac NSView*·win HWND·linux XID)를 받는다.
         let wi = WindowInfo::default().set_as_child(
-            parent,
+            r.nsview as cef::sys::cef_window_handle_t,
             &Rect { x: r.x, y: ns_y, width: r.w.max(1), height: r.h.max(1) },
         );
         let mut client = CefClient::new();
@@ -510,7 +519,7 @@ fn create_offscreen(r: &CreateReq, scale: f32) {
     let w = r.w.max(1);
     let h = r.h.max(1);
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-    crate::offscreen::create_surface(r.id, r.nsview, r.x, r.y, w, h, scale);
+    crate::presenter::create_surface(r.id, r.nsview, r.x, r.y, w, h, scale);
     if let Ok(mut c) = OSR_CREATING.lock() {
         *c = Some((w, h, scale));
     }
@@ -522,7 +531,11 @@ fn create_offscreen(r: &CreateReq, scale: f32) {
     // 그 뷰를 반환하고, do_close/was_hidden 등 window_handle 경로가 "창의 contentView" 를 제거/숨김
     // 처리해 메인 웹뷰가 창에서 분리된다(실측: 캡처 with_webview 가 detached 웹뷰를 만나 앱 사망).
     // DPI/모니터 정보는 RenderHandler::screen_info 가 정본으로 공급한다.
-    wi.parent_view = std::ptr::null_mut();
+    // parent_view 는 macOS 전용 필드. non-macOS 는 parent_window 가 default 0(부모 없음)로 동일 의도.
+    #[cfg(target_os = "macos")]
+    {
+        wi.parent_view = std::ptr::null_mut();
+    }
     wi.bounds = Rect { x: 0, y: 0, width: w, height: h };
     let mut client = CefOsrClient::new();
     let mut bs = BrowserSettings::default();
@@ -552,7 +565,7 @@ fn create_offscreen(r: &CreateReq, scale: f32) {
             eprintln!("[chromium] offscreen browser 생성 OK (id={}, {w}x{h}@{scale})", r.id);
         }
         None => {
-            crate::offscreen::destroy(r.id);
+            crate::presenter::destroy(r.id);
             eprintln!("[chromium] offscreen browser 생성 실패 (id={})", r.id);
         }
     }
@@ -599,9 +612,9 @@ fn apply_ops() {
             Op::Bounds { id, x, y, w, h } => {
                 if close_requested(id) {
                     // 파괴 진행 중 — native view 접근 금지(use-after-free 방지).
-                } else if crate::offscreen::is_offscreen(id) {
+                } else if crate::presenter::is_offscreen(id) {
                     // offscreen — 프레젠터 뷰 프레임 갱신 후 뷰포트 재보고(view_rect 가 새 크기를 답한다).
-                    crate::offscreen::set_bounds(id, x, y, w, h.max(1));
+                    crate::presenter::set_bounds(id, x, y, w, h.max(1));
                     if let Some(host) = find_browser(id).and_then(|b| b.host()) {
                         host.was_resized();
                     }
@@ -655,8 +668,8 @@ fn apply_ops() {
                     bump_id(id); // 다시 보일 때 present 위해 틱 가동
                 }
                 // child 는 메인 webview 아래 — 오버레이는 자연히 위에 그려지므로 탭 숨김만 반영.
-                if crate::offscreen::is_offscreen(id) {
-                    crate::offscreen::set_hidden(id, hidden);
+                if crate::presenter::is_offscreen(id) {
+                    crate::presenter::set_hidden(id, hidden);
                     if let Some(host) = find_browser(id).and_then(|b| b.host()) {
                         host.was_hidden(if hidden { 1 } else { 0 });
                         if !hidden {
@@ -692,7 +705,7 @@ fn apply_ops() {
                 // do_close 의 removeFromSuperview 까지 child 가 화면에 잔존한다(실측 ~2s). 탭은 이미
                 // 닫힌 확정 상태이므로 서피스는 지금 사라져야 한다(파괴 완결은 그대로 do_close).
                 set_native_hidden(id, true); // windowless 는 window_handle=null 가드로 무해
-                crate::offscreen::set_hidden(id, true); // offscreen 프레젠터 뷰 즉시 숨김(windowed 는 no-op)
+                crate::presenter::set_hidden(id, true); // offscreen 프레젠터 뷰 즉시 숨김(windowed 는 no-op)
                 // force(1) — 수명은 호스트(워크스페이스) 소유: 뷰 닫기는 이미 확정된 결정이다.
                 // non-force(0)는 unload/beforeunload 에 막혀 조용히 중단될 수 있고(DevTools 프론트엔드
                 // 실측 — 탭은 사라지는데 child 가 유령으로 잔존), 우리는 JS dialog UI 도 없어 그 중단을
@@ -900,7 +913,7 @@ pub fn surfaces_info() -> Vec<(u32, String, bool)> {
             (
                 id,
                 owners.get(&id).cloned().unwrap_or_default(),
-                crate::offscreen::is_offscreen(id),
+                crate::presenter::is_offscreen(id),
             )
         })
         .collect()
@@ -937,7 +950,7 @@ fn reap_closing() {
             }
         }
         for i in &gone {
-            crate::offscreen::destroy(*i); // offscreen 프레젠터 회수(windowed 는 no-op)
+            crate::presenter::destroy(*i); // offscreen 프레젠터 회수(windowed 는 no-op)
             if let Ok(mut m) = PRESSED.lock() {
                 m.remove(i);
             }
@@ -1258,7 +1271,7 @@ wrap_life_span_handler! {
             // 가 안 나고 브라우저가 산 채 남는다(실측: closeBrowser=n, reaped=0 — 탭을 닫아도 프레젠터가
             // 화면에 잔존). 0 을 돌려 CEF 정상 close 시퀀스를 태운다 — 프레젠터 NSView 회수는
             // on_before_close→reap_closing 의 offscreen::destroy 가 한다.
-            if crate::offscreen::is_offscreen(eid) {
+            if crate::presenter::is_offscreen(eid) {
                 eprintln!("[chromium] do_close → offscreen(windowless) 정상 닫기 (eid={eid}, cef_id={cid})");
                 return 0;
             }
@@ -1390,14 +1403,14 @@ wrap_display_handler! {
         fn on_cursor_change(
             &self,
             browser: Option<&mut Browser>,
-            _cursor: *mut u8,
+            _cursor: CefCursorArg, // OS별 cursor 핸들 = 모듈 상단 별칭(매크로가 param attribute 불허 → 별칭 해소).
             type_: CursorType,
             _custom_cursor_info: Option<&CursorInfo>,
         ) -> ::std::os::raw::c_int {
             let Some(id) = browser.map(|b| b.identifier()).and_then(engine_id_of) else {
                 return 0;
             };
-            if !crate::offscreen::is_offscreen(id) {
+            if !crate::presenter::is_offscreen(id) {
                 return 0;
             }
             host_emit_json(&serde_json::json!({
@@ -1540,7 +1553,7 @@ wrap_render_handler! {
             let size = browser
                 .map(|b| b.identifier())
                 .and_then(engine_id_of)
-                .and_then(crate::offscreen::logical_size)
+                .and_then(crate::presenter::logical_size)
                 .or_else(|| OSR_CREATING.lock().ok().and_then(|c| c.map(|(w, h, _)| (w, h))));
             let (w, h) = size.unwrap_or((1, 1));
             *rect = Rect { x: 0, y: 0, width: w.max(1), height: h.max(1) };
@@ -1553,11 +1566,11 @@ wrap_render_handler! {
             let Some(info) = screen_info else { return 0 };
             let id = browser.map(|b| b.identifier()).and_then(engine_id_of);
             let scale = id
-                .and_then(crate::offscreen::scale_of)
+                .and_then(crate::presenter::scale_of)
                 .or_else(|| OSR_CREATING.lock().ok().and_then(|c| c.map(|(_, _, s)| s)))
                 .unwrap_or(1.0);
             let (w, h) = id
-                .and_then(crate::offscreen::logical_size)
+                .and_then(crate::presenter::logical_size)
                 .or_else(|| OSR_CREATING.lock().ok().and_then(|c| c.map(|(w, h, _)| (w, h))))
                 .unwrap_or((1, 1));
             info.device_scale_factor = scale;
@@ -1571,11 +1584,11 @@ wrap_render_handler! {
         // 표시 상태와 뷰-로컬 rect(DIP)를 이 두 콜백으로 알린다(스펙 §8 M4 합성의 제어 신호).
         fn on_popup_show(&self, browser: Option<&mut Browser>, show: ::std::os::raw::c_int) {
             let Some(id) = browser.map(|b| b.identifier()).and_then(engine_id_of) else { return };
-            crate::offscreen::popup_show(id, show != 0);
+            crate::presenter::popup_show(id, show != 0);
         }
         fn on_popup_size(&self, browser: Option<&mut Browser>, rect: Option<&Rect>) {
             let (Some(id), Some(r)) = (browser.map(|b| b.identifier()).and_then(engine_id_of), rect) else { return };
-            crate::offscreen::popup_rect(id, r.x, r.y, r.width, r.height);
+            crate::presenter::popup_rect(id, r.x, r.y, r.width, r.height);
         }
         fn on_accelerated_paint(
             &self,
@@ -1587,21 +1600,13 @@ wrap_render_handler! {
             let Some(info) = info else { return };
             let Some(id) = browser.map(|b| b.identifier()).and_then(engine_id_of) else { return };
             // default = PET_VIEW, 그 외 = PET_POPUP(select 드롭다운·자동완성 위젯) — 서브레이어 합성.
+            // 공유 텍스처는 OS별(mac IOSurface·win D3D11 HANDLE·linux DMA-BUF planes) — presenter 가
+            // AcceleratedPaintInfo 에서 자기 필드를 추출한다(인터페이스 일반화, engine 은 중립 전달).
             if type_ != PaintElementType::default() {
-                crate::offscreen::present_popup(
-                    id,
-                    info.shared_texture_io_surface,
-                    info.extra.coded_size.width,
-                    info.extra.coded_size.height,
-                );
+                crate::presenter::present_popup(id, info);
                 return;
             }
-            crate::offscreen::present(
-                id,
-                info.shared_texture_io_surface,
-                info.extra.coded_size.width,
-                info.extra.coded_size.height,
-            );
+            crate::presenter::present(id, info);
         }
         fn on_paint(
             &self,
@@ -1614,7 +1619,7 @@ wrap_render_handler! {
         ) {
             // 공유 텍스처 비활성 환경의 CPU 폴백 — 조용한 강등 금지(스펙 P2): 드랍 + 1회 로그.
             if let Some(id) = browser.map(|b| b.identifier()).and_then(engine_id_of) {
-                crate::offscreen::log_once(id, "CPU on_paint 경로 감지 — 공유 텍스처 비활성, 프레임 드랍");
+                crate::presenter::log_once(id, "CPU on_paint 경로 감지 — 공유 텍스처 비활성, 프레임 드랍");
             }
         }
     }
@@ -1721,6 +1726,7 @@ fn install_cef_app_protocol() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn load_framework_at(path: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -1734,12 +1740,21 @@ fn load_framework_at(path: &std::path::Path) -> bool {
 // 서브프로세스는 전용 helper 바이너리가 담당하므로 여기서 execute_process 를 부르지 않는다(cefsimple
 // 의 분리-helper 패턴). 성공 시 true.
 pub fn initialize(dist_dir: &std::path::Path) -> bool {
-    // framework dlopen — dist/Chromium Embedded Framework.framework
-    let framework_dir = dist_dir.join("Chromium Embedded Framework.framework");
-    let framework_bin = framework_dir.join("Chromium Embedded Framework");
-    if !load_framework_at(&framework_bin) {
-        eprintln!("[chromium] framework 로드 실패: {}", framework_bin.display());
-        return false;
+    // framework dlopen — dist/Chromium Embedded Framework.framework (macOS 전용 번들).
+    #[cfg(target_os = "macos")]
+    {
+        let framework_dir = dist_dir.join("Chromium Embedded Framework.framework");
+        let framework_bin = framework_dir.join("Chromium Embedded Framework");
+        if !load_framework_at(&framework_bin) {
+            eprintln!("[chromium] framework 로드 실패: {}", framework_bin.display());
+            return false;
+        }
+    }
+    // Phase E: linux=libcef.so / windows=libcef.dll 적재(.framework 는 macOS 전용). 현재 미적재.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &dist_dir;
+        eprintln!("[chromium] CEF 적재 미구현 (Phase E: linux/windows libcef)");
     }
     // NSApp 에 CefAppProtocol 주입 — framework 로드 후(프로토콜 심볼이 그 이미지에 등록됨),
     // cef::initialize 이전. 메서드 주입 + 프로토콜 conformance 둘 다 여기서 확정된다.
@@ -1784,21 +1799,27 @@ pub fn initialize(dist_dir: &std::path::Path) -> bool {
     let cache_dir = cache_root.join(std::process::id().to_string());
     let _ = CACHE_DIR.set(cache_dir.clone());
     settings.root_cache_path = CefString::from(cache_dir.to_string_lossy().as_ref());
-    // 서브프로세스 = dist 의 전용 helper(.app 안 — CEF 정본 macOS 배치에서 dist 가 Frameworks 역할).
-    // 실행파일명은 Chromium 관례("<이름> Helper") — 렌더러는 형제 "<이름> Helper (Renderer).app" 변형
-    // 번들에서 뜬다(실측: 변형 부재 시 렌더러 spawn 이 조용히 실패해 콘텐츠 blank). 변형 4종
-    // (Renderer/GPU/Plugin/Alerts)은 스테이징(make sidecar-chromium)이 배치한다.
-    let helper_app = dist_dir.join("soksak-sidecar-browser-chromium Helper.app");
-    let helper_bin = helper_app.join("Contents/MacOS/soksak-sidecar-browser-chromium Helper");
-    settings.browser_subprocess_path = CefString::from(helper_bin.to_string_lossy().as_ref());
-    // dlopen 한 framework 의 리소스(icudtl.dat/locales/.pak) 위치 — 없으면 "icudtl.dat not found" 로 죽음.
-    settings.framework_dir_path = CefString::from(framework_dir.to_string_lossy().as_ref());
-    settings.resources_dir_path =
-        CefString::from(framework_dir.join("Resources").to_string_lossy().as_ref());
-    // main_bundle_path — CEF mach-port rendezvous 서비스명은 메인 번들 정체성에서 파생된다. helper 의
-    // 최외곽 번들이 곧 helper .app 이므로 브라우저 쪽도 같은 번들을 메인으로 선언해 서비스명을 일치시킨다
-    // (검증된 기존 메커니즘의 재지향).
-    settings.main_bundle_path = CefString::from(helper_app.to_string_lossy().as_ref());
+    // CEF 프로세스/리소스 경로 = macOS .framework/.app 레이아웃 전용. linux/windows 는 libcef 를 dist 형제로
+    // 두는 다른 배치라 Phase E 에서 별도 배선(browser_subprocess_path=helper 바이너리·resources=libcef 형제).
+    #[cfg(target_os = "macos")]
+    {
+        let framework_dir = dist_dir.join("Chromium Embedded Framework.framework");
+        // 서브프로세스 = dist 의 전용 helper(.app 안 — CEF 정본 macOS 배치에서 dist 가 Frameworks 역할).
+        // 실행파일명은 Chromium 관례("<이름> Helper") — 렌더러는 형제 "<이름> Helper (Renderer).app" 변형
+        // 번들에서 뜬다(실측: 변형 부재 시 렌더러 spawn 이 조용히 실패해 콘텐츠 blank). 변형 4종
+        // (Renderer/GPU/Plugin/Alerts)은 스테이징(make sidecar-chromium)이 배치한다.
+        let helper_app = dist_dir.join("soksak-sidecar-browser-chromium Helper.app");
+        let helper_bin = helper_app.join("Contents/MacOS/soksak-sidecar-browser-chromium Helper");
+        settings.browser_subprocess_path = CefString::from(helper_bin.to_string_lossy().as_ref());
+        // dlopen 한 framework 의 리소스(icudtl.dat/locales/.pak) 위치 — 없으면 "icudtl.dat not found" 로 죽음.
+        settings.framework_dir_path = CefString::from(framework_dir.to_string_lossy().as_ref());
+        settings.resources_dir_path =
+            CefString::from(framework_dir.join("Resources").to_string_lossy().as_ref());
+        // main_bundle_path — CEF mach-port rendezvous 서비스명은 메인 번들 정체성에서 파생된다. helper 의
+        // 최외곽 번들이 곧 helper .app 이므로 브라우저 쪽도 같은 번들을 메인으로 선언해 서비스명을 일치시킨다
+        // (검증된 기존 메커니즘의 재지향).
+        settings.main_bundle_path = CefString::from(helper_app.to_string_lossy().as_ref());
+    }
     let mut app = CefApp::new();
     let ok = cef::initialize(
         Some(args.as_main_args()),

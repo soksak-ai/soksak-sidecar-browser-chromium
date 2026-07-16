@@ -4,11 +4,15 @@
 // 계약 요점: 모든 export 는 catch_unwind 로 감싼다(-2 = 패닉 트랩 — FFI 경계 unwinding 금지),
 // message/notify 는 임의 스레드에서 호출될 수 있고(엔진 내부가 메인큐로 큐잉), init/shutdown 은
 // 호스트가 메인스레드를 보장한다. reply 버퍼는 모듈이 할당하고 호스트가 soksak_sidecar_engine_free 로 돌려준다.
-
-#![cfg(target_os = "macos")]
+//
+// 멀티플랫폼: 크레이트는 5타깃(darwin arm64/x64·linux arm64/x64·windows) 컴파일. 플랫폼별 조각은 engine.rs
+// cfg(macos) 분기 + presenter/{macos,windows,linux}. macOS 전용 crate-level 게이트는 없다.
 
 mod engine;
+// 동결 오라클(검증 하니스 전용) — 프로덕션 프레젠터는 presenter/macos.rs. 오라클은 재활용하지 않는다.
+#[cfg(all(target_os = "macos", feature = "harness"))]
 mod offscreen;
+mod presenter;
 
 use std::ffi::{c_char, c_void};
 use std::sync::OnceLock;
@@ -313,7 +317,7 @@ fn dispatch(req: &serde_json::Value, surface: usize) -> Result<serde_json::Value
                     "closeNotFound": engine::DBG_CLOSE_NOTFOUND.load(std::sync::atomic::Ordering::Relaxed),
                     "reaped": engine::DBG_REAPED.load(std::sync::atomic::Ordering::Relaxed),
                     // offscreen 픽셀 경로 생존 수치 — E2E 가 frames>0 을 단언한다.
-                    "framesPresented": crate::offscreen::FRAMES_PRESENTED.load(std::sync::atomic::Ordering::Relaxed),
+                    "framesPresented": crate::presenter::FRAMES_PRESENTED.load(std::sync::atomic::Ordering::Relaxed),
                 }
             }))
         }
