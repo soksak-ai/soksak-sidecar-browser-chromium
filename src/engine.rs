@@ -242,6 +242,11 @@ fn find_browser(id: u32) -> Option<Browser> {
 static PUMP_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static IN_WORK: AtomicBool = AtomicBool::new(false);
 static REDO: AtomicBool = AtomicBool::new(false);
+// 비-macOS 펌프 만기(now_ms 기준, 0=예약 없음). macOS 는 GCD 가 코어 런루프에 do_work 를 자동 전달하지만
+// windows/linux 는 그 자동 채널이 없어 코어 메인루프가 drive_pump 를 tick 한다(Phase F 배선). 가장 이른
+// 만기만 유지한다.
+#[cfg(not(target_os = "macos"))]
+static PUMP_DUE_MS: AtomicU64 = AtomicU64::new(0);
 
 // 렌더 틱: external_message_pump 에선 CEF present 가 "활동 중 메시지루프가 계속 도는 것"을 전제한다
 // (안 돌면 렌더러 프레임이 합성/present 안 됨 → 흰 화면). 그래서 "보이는 브라우저 && 활동 중"일 때만
@@ -318,6 +323,7 @@ fn note_gone(id: u32) {
 // (OnScheduleMessagePumpWork)만으로 모는지 실측하기 위한 진단 게이트(사이드카 소유 env — 코어 env 아님).
 static NO_TICK: LazyLock<bool> =
     LazyLock::new(|| std::env::var("SOKSAK_SIDECAR_BROWSER_CHROMIUM_NO_TICK").as_deref() == Ok("1"));
+#[cfg(target_os = "macos")]
 fn start_render_tick() {
     if *NO_TICK {
         return;
@@ -327,6 +333,7 @@ fn start_render_tick() {
     }
     unsafe { dispatch_async_f(main_queue(), std::ptr::null_mut(), render_tick) };
 }
+#[cfg(target_os = "macos")]
 extern "C" fn render_tick(_ctx: *mut c_void) {
     if !visible_nonempty() || !is_active() {
         TICK_ON.store(false, Ordering::SeqCst);
@@ -338,8 +345,19 @@ extern "C" fn render_tick(_ctx: *mut c_void) {
         dispatch_after_f(when, main_queue(), std::ptr::null_mut(), render_tick);
     }
 }
+// 비-macOS 렌더 틱 시작 — 자가 재예약(GCD) 대신 만기를 세우고 코어의 drive_pump tick 이 프레임마다 몰아준다.
+#[cfg(not(target_os = "macos"))]
+fn start_render_tick() {
+    if *NO_TICK {
+        return;
+    }
+    TICK_ON.store(true, Ordering::SeqCst);
+    schedule_pump(0);
+}
 
 // libdispatch(GCD) 원시 FFI — libSystem 자동 링크. _dispatch_main_q 는 메인 시리얼 큐 심볼.
+// macOS 전용: windows/linux 에는 이 심볼이 없다(링크 미해결) — 비-macOS 는 drive_pump seam 을 쓴다.
+#[cfg(target_os = "macos")]
 #[allow(non_upper_case_globals)]
 extern "C" {
     static _dispatch_main_q: [u8; 0];
@@ -347,14 +365,17 @@ extern "C" {
     fn dispatch_after_f(when: u64, queue: *const c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
     fn dispatch_time(when: u64, delta: i64) -> u64;
 }
+#[cfg(target_os = "macos")]
 const DISPATCH_TIME_NOW: u64 = 0;
 
+#[cfg(target_os = "macos")]
 fn main_queue() -> *const c_void {
     core::ptr::addr_of!(_dispatch_main_q) as *const c_void
 }
 
 // CEF push(OnScheduleMessagePumpWork) 또는 request_create 가 부른다 — 어느 스레드든 안전. 메인런루프
 // 최상위에서 do_work 가 돌도록 GCD 로 디스패치. 이미 예약된 블록이 있으면 합쳐 버린다(스택 방지).
+#[cfg(target_os = "macos")]
 fn schedule_pump(delay_ms: i64) {
     if PUMP_SCHEDULED.swap(true, Ordering::SeqCst) {
         return;
@@ -371,9 +392,44 @@ fn schedule_pump(delay_ms: i64) {
 }
 
 // GCD 블록 진입(메인 스레드) — 예약 플래그 해제 후 실제 work.
+#[cfg(target_os = "macos")]
 extern "C" fn pump_entry(_ctx: *mut c_void) {
     PUMP_SCHEDULED.store(false, Ordering::SeqCst);
     do_work();
+}
+
+// 비-macOS 펌프 예약 — GCD 가 없어 만기만 기록한다(가장 이른 것 유지). 실제 do_work 는 코어 메인
+// 스레드(=CEF UI 스레드)가 drive_pump 를 tick 할 때 돈다. CEF 는 어느 스레드서도 이 콜백을 부를 수 있다.
+#[cfg(not(target_os = "macos"))]
+fn schedule_pump(delay_ms: i64) {
+    let due = now_ms().saturating_add(delay_ms.max(0) as u64).max(1);
+    let cur = PUMP_DUE_MS.load(Ordering::SeqCst);
+    if cur == 0 || due < cur {
+        PUMP_DUE_MS.store(due, Ordering::SeqCst);
+    }
+    PUMP_SCHEDULED.store(true, Ordering::SeqCst);
+}
+
+// 비-macOS 펌프 구동 seam — 코어 메인루프(=CEF UI 스레드, cef::initialize 를 부른 스레드)가 프레임마다
+// 호출한다. Phase F 가 코어측을 배선한다(linux=glib 기본 컨텍스트 idle/timeout, windows=메시지 전용 창
+// PostMessage/타이머 — macOS 의 GCD 메인큐 자동 전달과 동형). 만기가 지난 예약을 실행하고, 활동 중이면
+// 다음 프레임을 재예약한다.
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+pub(crate) fn drive_pump() {
+    let due = PUMP_DUE_MS.load(Ordering::SeqCst);
+    if due != 0 && now_ms() >= due {
+        PUMP_DUE_MS.store(0, Ordering::SeqCst);
+        PUMP_SCHEDULED.store(false, Ordering::SeqCst);
+        do_work();
+    }
+    if TICK_ON.load(Ordering::SeqCst) {
+        if !visible_nonempty() || !is_active() {
+            TICK_ON.store(false, Ordering::SeqCst);
+        } else if PUMP_DUE_MS.load(Ordering::SeqCst) == 0 {
+            schedule_pump(RENDER_TICK_MS);
+        }
+    }
 }
 
 // 실제 pump — 대기 임베드 요청 적용 + do_message_loop_work. do_message_loop_work 가 런루프를 spin 하며
