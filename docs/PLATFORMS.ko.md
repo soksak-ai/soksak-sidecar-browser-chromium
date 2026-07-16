@@ -45,10 +45,11 @@ wgpu 를 끌어오지 않는다.
 
 - macOS·Linux는 로컬 컴파일: `cargo check --target <triple>`. exit 코드를 직접 잡는다 —
   `cargo check … | tail`은 파이프(tail)의 exit를 보고해 실패를 가린다.
-- Windows는 CI 전용. `cef-dll-sys`가 CEF C++ 래퍼를 빌드할 때 리소스 컴파일러를
-  요구하는데 macOS 크로스컴파일 환경엔 없다. Linux가 비-macOS 코드 정합성의 로컬 프록시.
-- 네이티브 present는 각 OS 런타임에서 CI 검증(Linux는 xvfb). 컴파일만 되는 스텁은
-  합격한 플랫폼이 아니다.
+- Windows는 컴파일·링크 모두 CI 전용. `cef-dll-sys`가 CEF C++ 래퍼를 빌드할 때 리소스
+  컴파일러를 요구하는데 macOS 크로스컴파일 환경엔 없다. Linux가 비-macOS 코드 정합성의
+  로컬 프록시이고, Windows 링크는 CI 빌드 매트릭스의 몫이다.
+- 현재 다섯 타깃 전부 CI 에서 `cargo build`(컴파일+링크) 통과. 네이티브 present 는 각 OS
+  런타임 CI 검증(Linux xvfb)이 남았다. 컴파일만 되는 타깃은 아직 렌더 플랫폼이 아니다.
 
 ### 플랫폼 간 멱등
 
@@ -62,27 +63,38 @@ wgpu 를 끌어오지 않는다.
 
 ## 상태
 
+다섯 타깃 전부 — darwin arm64/x64·linux arm64/x64·windows x64 — CI 에서 컴파일·링크
+통과(`.github/workflows/ci.yml`, 발행 없는 빌드 매트릭스).
+
 - **macOS**: 프로덕션 present(raw Metal, `presenter/macos.rs`)는 harness 런타임 검증됨
   (프레임 present + 입력, IME 포함).
 - **Linux**: `presenter/linux.rs` — 부모 XID 아래 X11 child 창(`x11-dl`), 그 위 `wgpu::Surface`,
-  `osr_texture_import` → textured-quad 렌더 → present — 구현 완료, linux 타깃 클린 컴파일.
-  온스크린(child 창이 부모 아래 뜨고 프레임 보임)은 CI xvfb 검증이며 컴파일이 아니다.
-- **Windows**: `presenter/windows.rs`(같은 wgpu present + HWND child 창)는 미작성.
-  macOS 에서 컴파일 불가(CEF C++ 래퍼가 Windows 리소스 컴파일러 필요)라 CI 에서 작성·검증.
-- Linux/Windows CEF 적재(`libcef.{so,dll}`)는 여전히 스텁 — macOS `.framework` 경로만 배선.
+  `osr_texture_import` → textured-quad 렌더 → present — 컴파일·링크 통과. 온스크린(child 창이
+  부모 아래 뜨고 프레임 보임)은 CI xvfb 검증이 남았고 컴파일이 아니다.
+- **Windows**: `presenter/windows.rs`(같은 wgpu present + HWND child 창)는 컴파일·링크 통과.
+  macOS 에서 빌드 불가(CEF C++ 래퍼가 Windows 리소스 컴파일러 필요)라 CI 가 유일 경로.
+  기본 target dir 이 `MAX_PATH` 를 넘어 CI 는 `CARGO_TARGET_DIR` 을 짧은 루트로 둔다.
+- Linux/Windows CEF 는 빌드타임 링크(`cef-dll-sys` 가 `cargo::rustc-link-lib` 방출)라 런타임
+  로더가 없다 — 리소스 경로(`resources_dir_path`·`locales_dir_path`·`browser_subprocess_path`)만
+  설정한다. macOS 만 `.framework` 런타임 로더를 쓴다.
 
 Linux 는 가속(`on_accelerated_paint`→import→present)·CPU 폴백(`on_paint`→업로드→`present_cpu`)
 두 경로가 배선됨. SW GL CI(lavapipe)엔 하드웨어 DMA-BUF 가 없어 CEF 가 CPU 경로를 타므로, 그 폴백이
 CI 에서 프레임이 뜨게 하는 관건이다.
+
+메시지 펌프는 per-OS 다. macOS 는 사이드카가 GCD 메인큐로 `do_work` 를 코어 런루프에 마셜한다.
+Windows·Linux 엔 그 심볼이 없어 `schedule_pump` 이 가장 이른 만기를 기록하고 `drive_pump` 이
+실행한다 — 코어 메인루프가 tick 하는 seam(Windows 메시지 전용 창, Linux glib idle 소스)으로,
+macOS 런루프가 GCD 큐를 비우는 것과 동형이다. 그 코어측 tick 배선이 남은 런타임 단계다.
 
 ## 검증 게이트
 
 | 범위 | 검증 방법 | 위치 |
 |---|---|---|
 | macOS 프로덕션 present | harness 가 페이지 렌더 — 프레임+입력(IME 포함) | 로컬(harness 실행) |
+| 다섯 타깃 컴파일+링크 | `cargo build --target <triple>` 매트릭스(build 는 링크, check 는 아님) | CI(`ci.yml`) |
 | macOS/Linux 코드 정합 | `cargo check --target <triple>`(exit 직접 잡기) | 로컬 |
-| Windows 코드 | `cargo check`(CEF C++ 래퍼가 Windows RC 필요) | CI 전용 |
-| 온스크린 렌더(Linux/Windows) | xvfb 에서 harness 빌드·실행, 프레임 단언 | CI 전용 |
+| 온스크린 렌더(Linux/Windows) | xvfb 에서 harness 빌드·실행, 프레임 단언 | CI, 구축 예정 |
 | cross-OS 멱등 | 제어면 canonical 레코드 + per-OS 데이터면 fidelity | 구축 예정 |
 
 ## 디버깅
@@ -99,9 +111,14 @@ PASS(exit 0)=cefQuery 왕복 + offscreen 이면 present 경로·입력까지 성
 ## 로드맵
 
 - **A/B — 완료**: presenter 인터페이스+오라클 분리, 크레이트 게이트 해제, macOS·Linux 클린 컴파일.
-- **C/D — Linux 완료, Windows CI**: `presenter/linux.rs` 가속·CPU 폴백 두 경로 구현·클린 컴파일,
-  `presenter/windows.rs`(HWND child, 같은 wgpu 파이프라인)는 CI 에서 작성·컴파일. 온스크린은 CI xvfb.
-- **E**: Linux/Windows CEF 적재(`libcef.{so,dll}`).
-- **F**: 코어가 프레젠터에 per-OS 부모 핸들(X11 XID / HWND)을 macOS NSView 경로 옆에 넘김;
-  5타깃 릴리스 매트릭스 CI.
+- **C/D — 완료**: `presenter/linux.rs`·`presenter/windows.rs` 둘 다 가속·CPU 폴백 두 경로 구현
+  (X11/HWND child, 같은 wgpu 파이프라인).
+- **E — 완료**: Linux/Windows CEF 는 빌드타임 링크. 비-macOS init 은 프레임워크 적재 대신
+  리소스 경로만 설정한다.
+- **Phase 0 — 완료**: 다섯 타깃(darwin arm64/x64·linux arm64/x64·windows x64) 전부 CI 에서
+  컴파일·링크(`ci.yml` 빌드 매트릭스). 메시지 펌프는 per-OS 게이트(macOS GCD, 비-macOS `drive_pump` seam).
+- **온스크린 — 예정**: xvfb 에서 harness 실행해 프레임 단언. 현 harness 는 macOS 전용이라 Linux
+  harness(X11 부모→XID→오프스크린 브라우저→`framesPresented` 단언)가 필요하다.
+- **F — 예정**: 코어가 프레젠터에 per-OS 부모 핸들(X11 XID / HWND)을 macOS NSView 경로 옆에 넘기고,
+  메인루프에서 `drive_pump` 를 tick(glib idle / 메시지 전용 창)한다; 5타깃 릴리스 매트릭스 CI.
 - **멱등**: 제어면 canonical 투영 cross-OS 대조 + per-OS 데이터면 fidelity.

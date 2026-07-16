@@ -52,11 +52,13 @@ harness asserts the production output matches the oracle.
 - macOS and Linux compile locally: `cargo check --target <triple>`. Capture the
   exit code directly — `cargo check … | tail` reports the pipe's exit, not
   cargo's, and hides failures.
-- Windows compiles in CI only. `cef-dll-sys` builds CEF's C++ wrapper with a
-  resource compiler that is absent when cross-compiling from macOS. Linux is the
-  local proxy for non-macOS code correctness.
-- Native present is verified per-OS at runtime in CI (Linux under xvfb). A stub
-  that only compiles is not a passing platform.
+- Windows compiles and links in CI only. `cef-dll-sys` builds CEF's C++ wrapper
+  with a resource compiler that is absent when cross-compiling from macOS. Linux
+  is the local proxy for non-macOS code correctness; the Windows link is the CI
+  build matrix's job.
+- All five targets currently pass `cargo build` (compile + link) in CI. Native
+  present is still to be verified per-OS at runtime in CI (Linux under xvfb). A
+  target that only compiles is not yet a rendering platform.
 
 ### Equivalence across platforms
 
@@ -72,33 +74,46 @@ Two planes, mirroring the terminal contract (canonical projection + oracle):
 
 ## Status
 
+All five targets — darwin arm64/x64, linux arm64/x64, windows x64 — compile and
+link in CI (`.github/workflows/ci.yml`, a build-only matrix, no publish).
+
 - **macOS**: production present (raw Metal, `presenter/macos.rs`) is
   runtime-verified via the harness (frames presented + input, including IME).
 - **Linux**: `presenter/linux.rs` — X11 child window under the parent XID
   (`x11-dl`), a `wgpu::Surface` on it, `osr_texture_import` → textured-quad
-  render → present — is implemented and compiles clean for the linux target.
-  On-screen rendering (child window mapped under the parent, frames visible) is
-  verified in CI under xvfb, not by compilation.
-- **Windows**: `presenter/windows.rs` (the same wgpu present with an HWND child
-  window) is not yet written. It cannot be compiled from macOS — its CEF C++
-  wrapper needs the Windows resource compiler — so it is authored and verified
-  in CI.
-- CEF loading on Linux/Windows (`libcef.{so,dll}`) is still stubbed; only the
-  macOS `.framework` path is wired.
+  render → present — compiles and links. On-screen rendering (child window
+  mapped under the parent, frames visible) is still to be verified in CI under
+  xvfb, not by compilation.
+- **Windows**: `presenter/windows.rs` — the same wgpu present with an HWND child
+  window (`windows` crate) — compiles and links in CI. It cannot be built from
+  macOS: its CEF C++ wrapper needs the Windows resource compiler, so CI is the
+  only path. The default target dir crosses `MAX_PATH` there, so CI points
+  `CARGO_TARGET_DIR` at a short root.
+- CEF is linked at build time on Linux/Windows (`cef-dll-sys` emits
+  `cargo::rustc-link-lib`), so there is no runtime loader to wire — only the
+  resource paths (`resources_dir_path`, `locales_dir_path`,
+  `browser_subprocess_path`). Only macOS uses the `.framework` runtime loader.
 
 Both the accelerated (`on_accelerated_paint` → import → present) and the CPU
 fallback (`on_paint` → upload → `present_cpu`) paths are wired for Linux; on
 software-GL CI (lavapipe) CEF has no hardware DMA-BUF and takes the CPU path, so
 that fallback is what makes frames appear in CI.
 
+The message pump is per-OS. On macOS the sidecar marshals `do_work` onto the
+core's run loop through the GCD main queue. Windows and Linux have no such
+symbol, so `schedule_pump` records the earliest due time and `drive_pump` runs
+it — the seam the core's main loop ticks (a message-only window on Windows, a
+glib idle source on Linux), mirroring how the macOS run loop drains the GCD
+queue. Wiring that core-side tick is the remaining runtime step.
+
 ## Verification gates
 
 | Scope | How it is verified | Where |
 |---|---|---|
 | macOS production present | harness renders a page; frames + input (incl. IME) | local, run the harness |
+| All five targets compile + link | `cargo build --target <triple>` matrix (build links; check does not) | CI (`ci.yml`) |
 | macOS/Linux code correctness | `cargo check --target <triple>` (capture exit directly) | local |
-| Windows code | `cargo check` (its CEF C++ wrapper needs the Windows RC) | CI only |
-| On-screen render (Linux/Windows) | build + run the harness under xvfb, assert frames | CI only |
+| On-screen render (Linux/Windows) | build + run the harness under xvfb, assert frames | CI, to build |
 | Cross-OS equivalence | canonical control-plane record + per-OS data-plane fidelity | to build |
 
 ## Debugging
@@ -119,12 +134,18 @@ the parent, or the CPU fallback is not being exercised.
 
 - **A/B — done**: presenter interface + oracle split; crate un-gated; macOS and
   Linux compile clean.
-- **C/D — Linux done, Windows in CI**: `presenter/linux.rs` implements the
-  accelerated and CPU-fallback paths and compiles clean; `presenter/windows.rs`
-  (HWND child, same wgpu pipeline) is authored and compiled in CI. On-screen is
-  verified in CI under xvfb.
-- **E**: CEF library loading for Linux/Windows (`libcef.{so,dll}`).
-- **F**: the core hands the presenter a per-OS parent handle (X11 XID / HWND)
-  next to the macOS NSView path; 5-target release-matrix CI.
+- **C/D — done**: `presenter/linux.rs` and `presenter/windows.rs` both implement
+  the accelerated and CPU-fallback paths (X11/HWND child, same wgpu pipeline).
+- **E — done**: CEF is linked at build time on Linux/Windows; the non-macOS
+  init sets the resource paths instead of loading a framework.
+- **Phase 0 — done**: all five targets (darwin arm64/x64, linux arm64/x64,
+  windows x64) compile and link in CI (`ci.yml` build matrix). The message pump
+  is gated per-OS (macOS GCD, non-macOS `drive_pump` seam).
+- **On-screen — to do**: run the harness under xvfb and assert frames. The
+  current harness is macOS-only; a Linux harness (X11 parent → XID → offscreen
+  browser → assert `framesPresented`) is needed.
+- **F — to do**: the core hands the presenter a per-OS parent handle (X11 XID /
+  HWND) next to the macOS NSView path, and ticks `drive_pump` from its main loop
+  (glib idle / message-only window); 5-target release-matrix CI.
 - **Equivalence**: control-plane canonical projection compared across OS + a
   per-OS data-plane fidelity check.
