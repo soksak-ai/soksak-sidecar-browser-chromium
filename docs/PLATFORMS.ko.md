@@ -62,7 +62,12 @@ wgpu 를 끌어오지 않는다.
 
 ## 상태
 
-macOS·Linux 컴파일 GREEN, Windows는 CI 빌드. Windows·Linux의 네이티브 present는 로그
-스텁(조용한 성공 아님)이며 D3D11/DirectComposition·DMA-BUF/EGL 구현 대기.
-Linux/Windows의 CEF 적재(`libcef.{so,dll}`)도 스텁이며 구현 대기 — macOS `.framework`
-경로만 배선됨.
+- **macOS**: 프로덕션 present(raw Metal, `presenter/macos.rs`)는 harness 런타임 검증됨
+  (프레임 present + 입력, IME 포함).
+- **Linux**: `presenter/linux.rs` — 부모 XID 아래 X11 child 창(`x11-dl`), 그 위 `wgpu::Surface`,
+  `osr_texture_import` → textured-quad 렌더 → present — 구현 완료, linux 타깃 클린 컴파일.
+  온스크린(child 창이 부모 아래 뜨고 프레임 보임)은 CI xvfb 검증이며 컴파일이 아니다.
+- **Windows**: `presenter/windows.rs`(같은 wgpu present + HWND child 창)는 미작성.
+  macOS 에서 컴파일 불가(CEF C++ 래퍼가 Windows 리소스 컴파일러 필요)라 CI 에서 작성·검증.
+- Linux/Windows CEF 적재(`libcef.{so,dll}`)는 여전히 스텁 — macOS `.framework` 경로만 배선.
+  `on_paint` CPU 폴백(shared-texture 미지원 호스트용)은 미배선(가속 경로만).

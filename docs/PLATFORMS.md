@@ -72,8 +72,17 @@ Two planes, mirroring the terminal contract (canonical projection + oracle):
 
 ## Status
 
-Compiles GREEN on macOS and Linux; Windows builds in CI. Native present on
-Windows and Linux is stubbed with a logged marker (not silent success) pending
-the D3D11/DirectComposition and DMA-BUF/EGL implementations. CEF loading on
-Linux/Windows (`libcef.{so,dll}`) is stubbed pending implementation; only the
-macOS `.framework` path is wired.
+- **macOS**: production present (raw Metal, `presenter/macos.rs`) is
+  runtime-verified via the harness (frames presented + input, including IME).
+- **Linux**: `presenter/linux.rs` — X11 child window under the parent XID
+  (`x11-dl`), a `wgpu::Surface` on it, `osr_texture_import` → textured-quad
+  render → present — is implemented and compiles clean for the linux target.
+  On-screen rendering (child window mapped under the parent, frames visible) is
+  verified in CI under xvfb, not by compilation.
+- **Windows**: `presenter/windows.rs` (the same wgpu present with an HWND child
+  window) is not yet written. It cannot be compiled from macOS — its CEF C++
+  wrapper needs the Windows resource compiler — so it is authored and verified
+  in CI.
+- CEF loading on Linux/Windows (`libcef.{so,dll}`) is still stubbed; only the
+  macOS `.framework` path is wired. The `on_paint` CPU fallback (for hosts
+  without shared-texture support) is not wired yet (accelerated path only).
