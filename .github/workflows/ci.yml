@@ -40,6 +40,15 @@ jobs:
         with:
           toolchain: "1.96.0"
           targets: ${{ matrix.target }}
+      - name: Point Cargo at a short target dir on Windows
+        # cef-dll-sys compiles the CEF C++ wrapper. Actions checks this repo out to
+        # D:\a\<repo>\<repo>\; with our long repo name doubled, the wrapper's generated .obj
+        # paths (…\libcef_dll\cpptoc\test\api_version_test_*_cpptoc.obj) cross Windows MAX_PATH
+        # (260) and cl.exe aborts with C1083 "Cannot open compiler generated file". cef-rs's own
+        # CI escapes this only because its crate name ("cef") is short. A short target root keeps
+        # every generated path in bounds — no dependency or source change.
+        if: runner.os == 'Windows'
+        run: Add-Content -Path $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=D:\t"
       - name: Install the Linux CEF link dependency
         if: runner.os == 'Linux'
         run: sudo apt-get update -q && sudo apt-get install -yq libglib2.0-dev

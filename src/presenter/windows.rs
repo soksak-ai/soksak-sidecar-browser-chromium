@@ -253,7 +253,9 @@ pub(crate) fn create_surface(id: u32, parent: usize, x: i32, y: i32, w: i32, h: 
     let (w, h) = (w.max(1), h.max(1));
     unsafe {
         let hinstance: HINSTANCE = match GetModuleHandleW(None) {
-            Ok(m) => m.into(),
+            // HMODULE·HINSTANCE 는 둘 다 pub 필드 *mut c_void 뉴타입이지만 windows 크레이트에
+            // From<HMODULE> for HINSTANCE 가 없다 — 필드로 직접 구성한다(문서 확인).
+            Ok(m) => HINSTANCE(m.0),
             Err(_) => {
                 log_once(id, "GetModuleHandleW 실패");
                 return;
