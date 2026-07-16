@@ -1,7 +1,8 @@
-// offscreen 프레젠터 — Windows 구현. CEF 가 offscreen 렌더한 공유 텍스처(D3D11 shared HANDLE)를
-// 모듈 소유 child 표면의 DirectComposition visual 로 present 한다. 구조는 offscreen.rs(macOS reference)를
-// 미러한다: 서피스 레지스트리 · 3버퍼 풀 · 팝업 서브레이어 · present 스왑. GPU/윈도우 API 만 D3D11/DComp
-// 로 교체하고 상태 계약(논리크기·scale·hidden·popup)은 동일하게 유지한다.
+// offscreen 프레젠터 — Windows 구현. CEF 공유 텍스처(D3D11 HANDLE)를 cef 크레이트의 osr_texture_import
+// (accelerated_osr 피처, wgpu 29)로 wgpu::Texture 로 가져와(D3D11→Vulkan interop), 모듈 소유 child 창(HWND)
+// 의 wgpu::Surface 에 렌더한다. 세 네이티브 GPU 스택을 손으로 굴리지 않고 크레이트의 통합 임포터를 쓴다
+// (정석). linux 와 present 메커니즘(wgpu) 공유 — macOS(raw Metal, offscreen.rs) 만 별개. 상태 계약
+// (레지스트리·논리크기·scale·hidden·popup)은 offscreen.rs 를 미러한다.
 //
 // 진행 단계: 레지스트리·상태 부기는 완결(is_offscreen/logical_size/scale_of/set_bounds/set_hidden/
 // destroy/popup_*). 네이티브 child 창 생성·D3D11 풀·present blit 은 Phase C/D(CI 검증). 미구현 경로는
@@ -49,7 +50,7 @@ pub(crate) fn create_surface(id: u32, parent: usize, _x: i32, _y: i32, w: i32, h
             Surf { scale, log_w: w.max(1), log_h: h.max(1), hidden: false, popup_shown: false, popup_rect: (0, 0, 0, 0) },
         );
     }
-    log_once(id, "windows offscreen child 표면 생성 미구현 (Phase C/D: D3D11/DirectComposition)");
+    log_once(id, "windows offscreen child 표면 생성 미구현 (Phase C/D: HWND child + wgpu::Surface)");
 }
 
 pub(crate) fn set_bounds(id: u32, _x: i32, _y: i32, w: i32, h: i32) {
@@ -92,8 +93,8 @@ pub(crate) fn popup_rect(id: u32, x: i32, y: i32, w: i32, h: i32) {
 }
 
 pub(crate) fn present(id: u32, info: &cef::AcceleratedPaintInfo) {
-    let _ = info; // Phase C/D: info.shared_texture_handle (D3D11 HANDLE) → OpenSharedResource1 → DComp swap
-    log_once(id, "windows present 미구현 (Phase C/D: D3D11 shared HANDLE → DirectComposition swap)");
+    let _ = info; // Phase C/D: SharedTextureHandle::new(info).import_texture(&device) → wgpu::Texture → Surface
+    log_once(id, "windows present 미구현 (Phase C/D: osr_texture_import → wgpu::Texture → wgpu::Surface)");
 }
 
 pub(crate) fn present_popup(id: u32, info: &cef::AcceleratedPaintInfo) {

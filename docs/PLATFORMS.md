@@ -21,16 +21,23 @@ pixels are blitted from CEF's shared texture straight onto the native surface.
 hidden, popup, present). `engine.rs` calls only this interface and never a
 platform module directly.
 
-- `presenter/macos.rs` — production. IOSurface → Metal blit → CALayer.
-- `presenter/windows.rs` — D3D11 shared HANDLE → DirectComposition.
-- `presenter/linux.rs` — DMA-BUF plane fds → EGLImage → GL on an X11 child.
+- `presenter/macos.rs` — production. IOSurface → Metal blit → CALayer. This is
+  the frozen reference path and stays hand-rolled (raw Metal), untouched.
+- `presenter/windows.rs`, `presenter/linux.rs` — import CEF's shared texture with
+  the `cef` crate's `osr_texture_import` (feature `accelerated_osr`) into a
+  `wgpu::Texture`, then render it to a `wgpu::Surface` on the native child window.
 
-The per-OS split is inherent, not a design choice: CEF's `on_accelerated_paint`
-hands a different handle per platform (macOS IOSurface pointer, Windows D3D11
-`HANDLE`, Linux DMA-BUF planes), and the `cef` crate ships a separate importer
-for each (`osr_texture_import/{iosurface,d3d11,dmabuf}.rs`). Metal, D3D11, and
-EGL share no code. `present` takes `&AcceleratedPaintInfo` so each presenter
-extracts its own field.
+CEF's `on_accelerated_paint` hands a different handle per platform (macOS
+IOSurface pointer, Windows D3D11 `HANDLE`, Linux DMA-BUF planes). Rather than
+hand-roll three native GPU stacks, the new platforms use the crate's unified
+importer: `SharedTextureHandle::new(info).import_texture(&device)` returns a
+`wgpu::Texture` (Linux DMA-BUF→Vulkan, Windows D3D11→Vulkan interop), with a CPU
+fallback. So Windows and Linux share ONE present mechanism (wgpu); only macOS
+stays on raw Metal because its working path is the frozen reference. `present`
+takes `&AcceleratedPaintInfo` and each presenter consumes it its own way (macOS
+reads `shared_texture_io_surface`; wgpu presenters pass the whole info to the
+importer). wgpu is pinned to the version the `cef` crate uses (29) and enabled
+per-target for non-macOS only, so the macOS dylib does not pull it in.
 
 ## Oracle
 

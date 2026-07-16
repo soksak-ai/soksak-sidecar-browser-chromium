@@ -18,15 +18,21 @@ present한다. 프레젠테이션은 사이드카 안에 두며 코어로 옮기
 `presenter/mod.rs`는 플랫폼 무관 인터페이스(서피스 수명·bounds·hidden·popup·present).
 `engine.rs`는 이 인터페이스만 부르고 플랫폼 모듈을 직접 부르지 않는다.
 
-- `presenter/macos.rs` — 프로덕션. IOSurface → Metal blit → CALayer.
-- `presenter/windows.rs` — D3D11 shared HANDLE → DirectComposition.
-- `presenter/linux.rs` — DMA-BUF plane fd → EGLImage → X11 child의 GL.
+- `presenter/macos.rs` — 프로덕션. IOSurface → Metal blit → CALayer. 동결 레퍼런스
+  경로이고 hand-rolled(raw Metal) 그대로 불변.
+- `presenter/windows.rs`·`presenter/linux.rs` — CEF 공유 텍스처를 `cef` 크레이트의
+  `osr_texture_import`(피처 `accelerated_osr`)로 `wgpu::Texture` 로 가져와, 네이티브
+  child 창의 `wgpu::Surface` 에 렌더한다.
 
-per-OS 분기는 설계 선택이 아니라 도메인의 성질이다: CEF `on_accelerated_paint`가
-플랫폼별로 다른 핸들을 준다(macOS IOSurface 포인터·Windows D3D11 `HANDLE`·Linux
-DMA-BUF planes). `cef` 크레이트도 임포터를 셋 따로 제공한다
-(`osr_texture_import/{iosurface,d3d11,dmabuf}.rs`). Metal·D3D11·EGL은 공유 코드가 0.
-`present`는 `&AcceleratedPaintInfo`를 받아 각 프레젠터가 자기 필드를 추출한다.
+CEF `on_accelerated_paint`는 플랫폼별로 다른 핸들을 준다(macOS IOSurface·Windows
+D3D11 `HANDLE`·Linux DMA-BUF planes). 세 네이티브 GPU 스택을 손으로 굴리는 대신 신규
+플랫폼은 크레이트의 통합 임포터를 쓴다: `SharedTextureHandle::new(info).import_texture(&device)`
+가 `wgpu::Texture` 를 반환한다(Linux DMA-BUF→Vulkan·Windows D3D11→Vulkan interop, CPU
+폴백 포함). 그래서 Windows·Linux 는 present 메커니즘 하나(wgpu)를 공유하고, macOS 만
+raw Metal(작동 경로=동결 레퍼런스)에 남는다. `present`는 `&AcceleratedPaintInfo` 를 받아
+각자 소비한다(macOS 는 `shared_texture_io_surface`, wgpu 프레젠터는 info 전체를 임포터에).
+wgpu 는 `cef` 크레이트가 쓰는 버전(29)에 핀하고 non-macOS 타깃에서만 켜, macOS dylib 은
+wgpu 를 끌어오지 않는다.
 
 ## 오라클
 
