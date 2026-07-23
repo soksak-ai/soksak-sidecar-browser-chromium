@@ -290,6 +290,12 @@ fn dispatch(req: &serde_json::Value, surface: usize) -> Result<serde_json::Value
             let eval_id = engine::request_eval(id()?, js.to_string());
             Ok(serde_json::json!({ "ok": true, "evalId": eval_id }))
         }
+        "zoom" => {
+            // 페이지 줌(스펙 §Zoom) — factor 는 호스트가 합성한 유효 배율(창 줌 × 뷰 줌).
+            let factor = req.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            engine::set_zoom(id()?, factor);
+            Ok(serde_json::json!({ "ok": true }))
+        }
         "stop" => {
             engine::stop_load(id()?);
             Ok(serde_json::json!({ "ok": true }))

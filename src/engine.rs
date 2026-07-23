@@ -111,6 +111,9 @@ enum Op {
     Ime { id: u32, kind: u8, text: String, caret: u32 }, // kind 0=set 1=commit 2=finish 3=cancel
     // 호스트→페이지 JS 실행(스펙 §8 eval) — 결과는 query 브리지로 회수해 eval-result 이벤트로 배달.
     Eval { id: u32, eval_id: u64, js: String },
+    // 페이지 줌(스펙 §Zoom) — 호스트가 합성한 유효 배율(창 줌 × 뷰 줌). CEF 줌 레벨은
+    // 1.2^level = factor 관례이므로 level = ln(factor)/ln(1.2)로 변환해 적용한다.
+    Zoom { id: u32, factor: f64 },
 }
 static PENDING: LazyLock<Mutex<Vec<CreateReq>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static OPS: LazyLock<Mutex<Vec<Op>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -688,6 +691,12 @@ fn apply_ops() {
                     }
                 }
             }
+            Op::Zoom { id, factor } => {
+                if let Some(host) = find_browser(id).and_then(|b| b.host()) {
+                    let f = factor.clamp(0.25, 4.0);
+                    host.set_zoom_level(f.ln() / 1.2f64.ln());
+                }
+            }
             Op::Stop { id } => {
                 if let Some(b) = find_browser(id) {
                     b.stop_load();
@@ -1078,7 +1087,8 @@ fn request_op(op: Op) {
         | Op::Wheel { id, .. }
         | Op::Key { id, .. }
         | Op::Ime { id, .. }
-        | Op::Eval { id, .. } => bump_id(*id),
+        | Op::Eval { id, .. }
+        | Op::Zoom { id, .. } => bump_id(*id),
         Op::Close { .. } => {}
         Op::Overlay { .. } => bump_active(), // 전체 숨김/복귀 — id 없음
     }
@@ -1096,6 +1106,9 @@ pub fn reload(id: u32, ignore_cache: bool) {
 }
 pub fn stop_load(id: u32) {
     request_op(Op::Stop { id });
+}
+pub fn set_zoom(id: u32, factor: f64) {
+    request_op(Op::Zoom { id, factor });
 }
 pub fn go_back(id: u32) {
     request_op(Op::Back { id });
