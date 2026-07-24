@@ -124,6 +124,9 @@ fn ensure_server() {
         }
     });
     // 인코더 워커 — 최신 프레임을 JPEG 로 인코드해 해당 id 구독자 전원에 multipart 파트 송신.
+    // 20초 무프레임이면 하트비트 파트(text/plain 1바이트)를 흘린다 — WebKit(NSURLSession)의
+    // 60초 무데이터 워치독이 정적 페이지 스트림을 "Load failed" 로 끊는 실측의 근치. 겸사겸사
+    // 죽은 구독자도 이때 정리된다(write 실패 prune).
     std::thread::spawn(|| {
         let (slot, cv) = &*LATEST;
         loop {
@@ -131,12 +134,21 @@ fn ensure_server() {
                 let mut guard = slot.lock().unwrap();
                 loop {
                     if let Some(f) = guard.take() {
-                        break f;
+                        break Some(f);
                     }
-                    guard = cv.wait(guard).unwrap();
+                    let (g, timeout) = cv
+                        .wait_timeout(guard, std::time::Duration::from_secs(20))
+                        .unwrap();
+                    guard = g;
+                    if timeout.timed_out() {
+                        break None;
+                    }
                 }
             };
-            encode_and_fanout(frame);
+            match frame {
+                Some(f) => encode_and_fanout(f),
+                None => heartbeat_all(),
+            }
         }
     });
 }
@@ -176,6 +188,16 @@ fn accept_client(mut stream: TcpStream) {
         subs.entry(id).or_default().push(stream);
     }
     crate::engine::kick_paint(id); // 구독 직후 1프레임 보장(정적 페이지)
+}
+
+// 모든 구독자에 무의미 파트 1개 — 연결 유지 전용(클라이언트 파서는 image/jpeg 아닌 파트를 버린다).
+fn heartbeat_all() {
+    const PART: &[u8] = b"--sksframe\r\nContent-Type: text/plain\r\nContent-Length: 1\r\n\r\n.\r\n";
+    if let Ok(mut subs) = SUBS.lock() {
+        for list in subs.values_mut() {
+            list.retain_mut(|s| s.write_all(PART).is_ok());
+        }
+    }
 }
 
 fn encode_and_fanout(f: Frame) {
