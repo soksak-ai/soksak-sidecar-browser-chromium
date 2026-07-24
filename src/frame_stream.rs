@@ -159,9 +159,12 @@ fn accept_client(mut stream: TcpStream) {
         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
         return;
     };
+    // CORS 개방 — 소비자는 메인 웹뷰(fetch, 교차 출처 localhost)다. <img> 와 달리 fetch 는
+    // CORS 대상이라 이 헤더가 없으면 연결 직후 응답이 거부된다(루프백 한정 서버라 개방 무해).
     let ok = stream.write_all(
         b"HTTP/1.1 200 OK\r\n\
           Content-Type: multipart/x-mixed-replace; boundary=sksframe\r\n\
+          Access-Control-Allow-Origin: *\r\n\
           Cache-Control: no-store\r\n\
           Connection: close\r\n\r\n",
     );
