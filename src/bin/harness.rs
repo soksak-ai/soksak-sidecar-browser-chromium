@@ -356,6 +356,63 @@ mod run {
                 }
             }
 
+            // windowed 픽셀 게이트 — Q_OK(쿼리)만으로는 "합성이 화면에 닿는다"를 증명하지
+            // 못한다(실사고: windowed 가 수 세션 동안 블랭크였는데 PASS). 자기 창을 BMP 로
+            // 캡처해 테스트 페이지(#223 어두운 배경)의 픽셀이 실재하는지 단언한다.
+            fn windowed_pixels_ok(window: &winit::window::Window) -> Option<bool> {
+                #[cfg(target_os = "macos")]
+                {
+                    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                    use objc2::msg_send;
+                    use objc2::runtime::AnyObject;
+                    let RawWindowHandle::AppKit(h) = window.window_handle().ok()?.as_raw() else {
+                        return None;
+                    };
+                    let num: isize = unsafe {
+                        let view = h.ns_view.as_ptr() as *mut AnyObject;
+                        let win: *mut AnyObject = msg_send![&*view, window];
+                        if win.is_null() {
+                            return None;
+                        }
+                        msg_send![&*win, windowNumber]
+                    };
+                    let tmp = std::env::temp_dir().join(format!("harness-px-{num}.bmp"));
+                    let ok = std::process::Command::new("screencapture")
+                        .args(["-x", "-o", "-t", "bmp", &format!("-l{num}")])
+                        .arg(&tmp)
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if !ok {
+                        return None; // 권한 부재 등 — 게이트 판정 불가(경고만)
+                    }
+                    let bytes = std::fs::read(&tmp).ok()?;
+                    let _ = std::fs::remove_file(&tmp);
+                    if bytes.len() < 54 + 4000 {
+                        return Some(false);
+                    }
+                    // BMP 픽셀부 샘플링 — 어두운 픽셀(#223 배경, B<0x60) 비율로 콘텐츠 실재 판정.
+                    let px = &bytes[54..];
+                    let (mut dark, mut total) = (0u64, 0u64);
+                    let mut i = 0;
+                    while i + 4 <= px.len() {
+                        if px[i] < 0x60 && px[i + 1] < 0x60 && px[i + 2] < 0x60 {
+                            dark += 1;
+                        }
+                        total += 1;
+                        i += 4 * 97; // 성긴 샘플링(전수 불요)
+                    }
+                    let ratio = dark as f64 / total.max(1) as f64;
+                    println!("[harness] 픽셀 게이트: dark비율={ratio:.3} (기준 >0.30)");
+                    Some(ratio > 0.30)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = window;
+                    None
+                }
+            }
+
             // offscreen 최종 단언: key 단계의 'a' 뒤에 IME commit '한글'이 붙는다 → "IME_OK:a한글".
             let title_pass = if self.mode == "offscreen" {
                 title.starts_with("IME_OK:") && title.ends_with("한글")
@@ -369,7 +426,22 @@ mod run {
                     "[harness] 판정: created={} query_seen={q} frames={frames} phase={} last_title={title:?}",
                     self.created, self.input_phase
                 );
-                let pass = self.created && q && title_pass && frames > 0;
+                // windowed 픽셀 게이트 — 쿼리 성공 뒤 실픽셀을 단언한다(합성 도달 증명).
+                let pixels_pass = if self.mode == "windowed" && title_pass {
+                    match self.window.as_ref().and_then(windowed_pixels_ok) {
+                        Some(v) => {
+                            println!("[harness] 픽셀 게이트: {}", if v { "GREEN" } else { "RED — 블랭크" });
+                            v
+                        }
+                        None => {
+                            println!("[harness] 픽셀 게이트: 판정 불가(캡처 권한 등) — 게이트 생략");
+                            true
+                        }
+                    }
+                } else {
+                    true
+                };
+                let pass = self.created && q && title_pass && frames > 0 && pixels_pass;
                 println!("[harness] {}", if pass { "PASS" } else { "FAIL" });
                 std::process::exit(if pass { 0 } else { 1 });
             }
