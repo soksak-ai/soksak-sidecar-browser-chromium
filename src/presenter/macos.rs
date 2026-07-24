@@ -408,6 +408,10 @@ fn present_target(id: u32, cef_surface: *mut c_void, coded_w: i32, coded_h: i32,
             let _: () = msg_send![&*layer, setContents: &*dst_surface];
             let _: () = msg_send![class!(CATransaction), commit];
             pool.next = (slot + 1) % POOL;
+            // DOM 프레젠터 스트림 탭(스파이크, 기본 off) — 구독자 있을 때만 CPU 복사(무구독 = no-op).
+            if !popup {
+                crate::frame_stream::maybe_submit(id, dst_surface, coded_w, coded_h);
+            }
             FRAMES_PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // 첫 프레임 1회 로그 — 픽셀 경로 생존 증거(E2E 하니스/진단이 이 라인을 관찰한다).
             log_once(id, if popup { "첫 팝업 프레임 present (shared-texture → sublayer)" } else { "첫 프레임 present (shared-texture → layer)" });

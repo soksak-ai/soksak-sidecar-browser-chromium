@@ -15,6 +15,8 @@ mod engine;
 #[cfg(all(target_os = "macos", feature = "harness"))]
 #[allow(dead_code)]
 mod offscreen;
+#[cfg(target_os = "macos")]
+mod frame_stream;
 mod presenter;
 
 use std::ffi::{c_char, c_void};
@@ -289,6 +291,13 @@ fn dispatch(req: &serde_json::Value, surface: usize) -> Result<serde_json::Value
             let js = req.get("js").and_then(|j| j.as_str()).ok_or("js 필요")?;
             let eval_id = engine::request_eval(id()?, js.to_string());
             Ok(serde_json::json!({ "ok": true, "evalId": eval_id }))
+        }
+        "frame-stream" => {
+            // DOM 프레젠터 스파이크(기본 off) — MJPEG 스트림 켜기/끄기, 반환 port 로
+            // 플러그인이 <img src=http://127.0.0.1:<port>/s/<id>> 를 세운다.
+            let on = req.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+            let port = frame_stream::enable(id()? as u32, on);
+            Ok(serde_json::json!({ "ok": true, "port": port }))
         }
         "zoom" => {
             // 페이지 줌(스펙 §Zoom) — factor 는 호스트가 합성한 유효 배율(창 줌 × 뷰 줌).
