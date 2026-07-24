@@ -18,6 +18,9 @@ mod run {
     static SURFACE: AtomicUsize = AtomicUsize::new(0);
     static QUERY_SEEN: AtomicBool = AtomicBool::new(false);
     static LAST_TITLE: Mutex<String> = Mutex::new(String::new());
+    // paint-cadence 측정 결과(-1=진행 중) — 프레임 스트림 파트 수 = 페인트 수.
+    static CADENCE_STATIC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    static CADENCE_ANIM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
     // 호스트 vtable emit — 코어의 host_emit 대역. 모든 이벤트를 stdout 에 남기고, query 에는
     // 플러그인처럼 즉시 pong 응답(query-reply)한다.
@@ -74,12 +77,47 @@ mod run {
     // 입력 판정: input 포커스=CLICK_OK, wheel=WHEEL_OK, keydown=KEY_OK, input 값 변화=IME_OK.
     const TEST_PAGE: &str = "data:text/html,<title>boot</title><body style=\"background:%23223;color:%23eee;font:20px monospace\">HARNESS<input id=t style=\"position:fixed;left:20px;top:60px;width:220px;height:40px;font-size:20px\"><script>var t=document.getElementById('t');var keyDone=false;t.addEventListener('focus',function(){document.title='CLICK_OK';});window.addEventListener('wheel',function(e){if(document.title.indexOf('CLICK_OK')===0)document.title='WHEEL_OK:'+(e.deltaY>0?'down':'up');});window.addEventListener('keydown',function(e){if(!keyDone&&document.title.indexOf('WHEEL_OK')===0){keyDone=true;document.title='KEY_OK:'+e.keyCode;}});t.addEventListener('input',function(){if(document.title.indexOf('KEY_OK')===0||document.title.indexOf('IME')===0)document.title='IME_OK:'+t.value;});document.title='Q_TYPEOF:'+(typeof window.cefQuery);if(window.cefQuery){window.cefQuery({request:'harness-ping',persistent:false,onSuccess:function(r){document.title='Q_OK:'+r;},onFailure:function(c,m){document.title='Q_FAIL:'+c+':'+m;}});}</script></body>";
 
+    // 페인트 케이던스 시나리오(paint-cadence 모드)용 페이지들 — 정적(스크립트·애니 없음)과
+    // 페인트-무효화 애니메이션(배경색 keyframes; 합성 전용 transform 은 렌더러 손상 없이 돌 수
+    // 있어 측정 대상이 아니다).
+    const STATIC_PAGE: &str =
+        "data:text/html,<title>static</title><body style=\"margin:0;background:%23274\"><h1>STATIC</h1></body>";
+    const ANIM_PAGE: &str = "data:text/html,<title>anim</title><style>@keyframes p{from{background:%23f00}to{background:%2300f}}</style><body style=\"margin:0\"><div style=\"width:100%25;height:100vh;animation:p 0.5s linear infinite alternate\"></div></body>";
+
+    // MJPEG 스트림을 secs 동안 읽어 JPEG 파트 수를 센다(파트 수 = 페인트 수). 연결 자체가
+    // 구독 킥(kick_paint)을 발생시킨다 — 정적 페이지 첫 프레임 보장 검증에 그 킥을 그대로 쓴다.
+    fn count_stream_parts(port: u16, id: u32, secs: f32) -> i64 {
+        use std::io::{Read as _, Write as _};
+        let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else { return -2 };
+        let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+        if s.write_all(format!("GET /s/{id} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).is_err() {
+            return -2;
+        }
+        let deadline = Instant::now() + Duration::from_secs_f32(secs);
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 65536];
+        while Instant::now() < deadline {
+            match s.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => {} // read timeout — 계속 대기
+            }
+        }
+        let needle = b"Content-Type: image/jpeg";
+        buf.windows(needle.len()).filter(|w| *w == needle).count() as i64
+    }
+
     struct App {
         dist: std::path::PathBuf,
         mode: String,
         window: Option<winit::window::Window>,
         started: Option<Instant>,
         created: bool,
+        // paint-cadence 진행 단계: 0=정착 대기, 1=정적 계수 중, 2=애니 로드 후 grace 만료 대기,
+        // 3=애니 계수 중. cadence_mark = 직전 단계 전환 시각.
+        cadence_phase: u8,
+        cadence_mark: Instant,
+        cadence_port: u16,
         // 입력 검증 상태기계(offscreen 전용) — title 전이에 맞춰 다음 입력 메시지를 보낸다.
         // 0=쿼리 대기, 1=클릭 송신됨, 2=휠 송신됨, 3=키 송신됨, 4=IME 송신됨.
         input_phase: u8,
@@ -170,10 +208,11 @@ mod run {
             println!("[harness] init rc={rc}");
             assert_eq!(rc, 0, "engine init 실패");
 
+            let url = if self.mode == "paint-cadence" { STATIC_PAGE } else { TEST_PAGE };
             let mut create = serde_json::json!({
-                "type": "create", "x": 10, "y": 10, "w": 700, "h": 440, "url": TEST_PAGE
+                "type": "create", "x": 10, "y": 10, "w": 700, "h": 440, "url": url
             });
-            if self.mode == "offscreen" {
+            if self.mode == "offscreen" || self.mode == "paint-cadence" {
                 create["mode"] = "offscreen".into();
                 create["scale"] = 2.0.into();
             }
@@ -205,6 +244,68 @@ mod run {
                 ));
                 return;
             };
+            // paint-cadence 시나리오 — 페인트 수를 프레임 스트림 파트 수로 직접 계수한다.
+            // 판정 2축: ① 정적 페이지 구독 3초 = 1..=6 파트(첫 프레임 보장 + 강제 재페인트 폭풍
+            // 부재), ② 활동 grace 만료 후 애니메이션 3초 ≥ 30 파트(호스트 박자 + 손상-구동
+            // 자가지속으로 연속 콘텐츠가 동결되지 않음).
+            if self.mode == "paint-cadence" {
+                use std::sync::atomic::Ordering as O;
+                match self.cadence_phase {
+                    0 if t0.elapsed() > Duration::from_millis(1200) => {
+                        let out = send(&serde_json::json!({ "type": "frame-stream", "id": 1, "enable": true }));
+                        let port = out.get("port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+                        println!("[harness] frame-stream port={port} — 정적 3초 계수 시작");
+                        if port == 0 {
+                            println!("[harness] FAIL (frame-stream 포트 없음)");
+                            std::process::exit(1);
+                        }
+                        std::thread::spawn(move || {
+                            CADENCE_STATIC.store(count_stream_parts(port, 1, 3.0), O::SeqCst);
+                        });
+                        self.cadence_port = port;
+                        self.cadence_phase = 1;
+                    }
+                    1 if CADENCE_STATIC.load(O::SeqCst) != -1 => {
+                        println!("[harness] 정적 파트={} — 애니 페이지 로드", CADENCE_STATIC.load(O::SeqCst));
+                        send(&serde_json::json!({ "type": "load", "id": 1, "url": ANIM_PAGE }));
+                        self.cadence_phase = 2;
+                        self.cadence_mark = Instant::now();
+                    }
+                    // 로드 활동 grace(1.5s)가 완전히 만료된 뒤에 계수해야 "박자가 스스로 지속되는가"
+                    // 를 재는 것이 된다(만료 전 계수는 로드 활동창의 잔광도 세어 판정이 흐려진다).
+                    2 if self.cadence_mark.elapsed() > Duration::from_millis(2500) => {
+                        let port = self.cadence_port;
+                        println!("[harness] grace 만료 — 애니 3초 계수 시작");
+                        std::thread::spawn(move || {
+                            CADENCE_ANIM.store(count_stream_parts(port, 1, 3.0), O::SeqCst);
+                        });
+                        self.cadence_phase = 3;
+                    }
+                    3 if CADENCE_ANIM.load(O::SeqCst) != -1 => {
+                        let st = CADENCE_STATIC.load(O::SeqCst);
+                        let an = CADENCE_ANIM.load(O::SeqCst);
+                        let pass = (1..=6).contains(&st) && an >= 30;
+                        println!("[harness] 케이던스 판정: static={st}(기준 1..=6) anim={an}(기준 >=30)");
+                        println!("[harness] {}", if pass { "PASS" } else { "FAIL" });
+                        std::process::exit(if pass { 0 } else { 1 });
+                    }
+                    _ => {}
+                }
+                if t0.elapsed() > Duration::from_secs(30) {
+                    println!(
+                        "[harness] FAIL (케이던스 타임아웃: phase={} static={} anim={})",
+                        self.cadence_phase,
+                        CADENCE_STATIC.load(O::SeqCst),
+                        CADENCE_ANIM.load(O::SeqCst)
+                    );
+                    std::process::exit(1);
+                }
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(50),
+                ));
+                return;
+            }
+
             let title = LAST_TITLE.lock().unwrap().clone();
             // offscreen 은 픽셀 경로 생존(stats.dbg.framesPresented > 0)까지 요구 — 쿼리만 빠르게
             // 성공하고 첫 페인트 전에 종료해 픽셀 경로를 미검증으로 남기는 오판을 막는다.
@@ -300,6 +401,9 @@ mod run {
             created: false,
             input_phase: 0,
             last_input: Instant::now(),
+            cadence_phase: 0,
+            cadence_mark: Instant::now(),
+            cadence_port: 0,
         };
         event_loop.run_app(&mut app).expect("run");
     }

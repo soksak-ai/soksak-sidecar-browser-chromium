@@ -291,6 +291,20 @@ fn bump_active() {
     ACTIVE_UNTIL_MS.store(now_ms() + ACTIVE_GRACE_MS, Ordering::Relaxed);
     start_render_tick();
 }
+// 프레임 스트림 구독 킥(frame_stream) — 정적 페이지는 손상이 없어 구독 후 첫 프레임이
+// 영영 안 온다. 1회 강제 손상을 예약(다음 do_work 가 메인 스레드에서 invalidate)하고 활동
+// 창을 열어 begin-frame 틱이 그 손상을 프레임으로 배달하게 한다. 어느 스레드서든 안전.
+pub(crate) fn kick_paint(id: u32) {
+    if let Ok(mut k) = KICK_IDS.lock() {
+        k.insert(id);
+    }
+    bump_id(id);
+}
+
+// "지금 프레임 하나가 반드시 필요"한 서피스 — 다음 do_work 에서 1회 강제 손상 후 비운다.
+static KICK_IDS: LazyLock<Mutex<std::collections::HashSet<u32>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 // 서피스별 활동 — 이 id 만 invalidate 대상에 든다.
 fn bump_id(id: u32) {
     if let Ok(mut m) = ACTIVE_IDS.lock() {
@@ -446,12 +460,12 @@ fn do_work() {
     apply_pending();
     apply_ops();
     do_message_loop_work();
-    // offscreen 프레임 구동 — windowed 는 CEF 가 자기 NSView 로 합성하지만 offscreen 은 on_accelerated_paint
-    // 이 "손상 + 펌프"에 걸려야 프레임을 낸다. external_message_pump 만으론 내부 프레임 타이머가 안 도는
-    // 실측(로드 완료 후 정지 프레임이 blank 로 남음). active 인 동안만 offscreen 뷰를 invalidate 해 로드/
-    // 애니메이션 중 프레임을 확보한다 — active 가 끝나면(정적) 멈춰 idle 0(마지막 프레임은 레이어에 잔존).
+    // offscreen 프레임 구동(external begin frame) — 내부 프레임 타이머는 생성 시
+    // external_begin_frame_enabled 로 껐고, 호스트가 활동 중에만 begin-frame 박자를 공급한다.
+    // invalidate 와 달리 강제 손상이 아니라서 그릴지는 렌더러가 손상으로 결정한다(정적 페이지는
+    // 박자만 받고 스킵) — active 가 끝나면 박자도 멈춰 idle 0(마지막 프레임은 레이어에 잔존).
     if is_active() {
-        invalidate_offscreen();
+        drive_offscreen_frames();
     }
     reap_closing();
     IN_WORK.store(false, Ordering::SeqCst);
@@ -460,11 +474,11 @@ fn do_work() {
     }
 }
 
-// active 인 offscreen 브라우저를 invalidate — CEF 가 손상 영역을 다시 그려 on_accelerated_paint 를
-// 낸다(변화 없으면 CEF 가 스스로 스킵 — 과잉 렌더 아님). 메인 스레드 전용(do_work 안).
-fn invalidate_offscreen() {
+// active 인 offscreen 브라우저에 begin-frame 박자 공급 — 렌더러는 손상이 있을 때만 프레임을
+// 낸다(on_accelerated_paint). kick 예약된 서피스만 1회 invalidate(강제 손상)를 먼저 넣어
+// 정적 콘텐츠도 프레임 하나를 보장한다. 메인 스레드 전용(do_work 안).
+fn drive_offscreen_frames() {
     // 활동 중인 서피스만 — (per-id 활동 창) ∪ (자기 cid 가 로딩 중) ∪ (전역 창: Overlay 등).
-    // 전면 invalidate 는 CEF 에 강제 손상이라 정적 페이지도 매 틱 재페인트된다(스킵 없음, 실측).
     let now = now_ms();
     let global = now < ACTIVE_UNTIL_MS.load(Ordering::Relaxed);
     let active: std::collections::HashSet<u32> = ACTIVE_IDS
@@ -473,6 +487,10 @@ fn invalidate_offscreen() {
         .unwrap_or_default();
     let loading: std::collections::HashSet<i32> =
         LOADING.lock().map(|s| s.clone()).unwrap_or_default();
+    let kicked: std::collections::HashSet<u32> = KICK_IDS
+        .lock()
+        .map(|mut k| std::mem::take(&mut *k))
+        .unwrap_or_default();
     let pairs: Vec<(u32, i32)> = BROWSERS
         .lock()
         .map(|l| l.iter().map(|(i, b)| (*i, b.identifier())).collect())
@@ -481,11 +499,14 @@ fn invalidate_offscreen() {
         if !crate::presenter::is_offscreen(id) {
             continue;
         }
-        if !(global || active.contains(&id) || loading.contains(&cid)) {
+        if !(global || active.contains(&id) || loading.contains(&cid) || kicked.contains(&id)) {
             continue;
         }
         if let Some(host) = find_browser(id).and_then(|b| b.host()) {
-            host.invalidate(PaintElementType::default()); // PET_VIEW
+            if kicked.contains(&id) {
+                host.invalidate(PaintElementType::default()); // PET_VIEW — 1회 강제 손상
+            }
+            host.send_external_begin_frame();
         }
     }
 }
@@ -620,6 +641,10 @@ fn create_offscreen(r: &CreateReq, scale: f32) {
     wi.windowless_rendering_enabled = 1;
     // 공유 텍스처(OnAcceleratedPaint · IOSurface) 경로 — CPU on_paint 는 계약 밖(1회 로그 후 드랍).
     wi.shared_texture_enabled = 1;
+    // 프레임 생산의 시계를 호스트가 쥔다(cef-mixer 방식) — CEF 내부 타이머 대신 do_work 의
+    // drive_offscreen_frames 가 send_external_begin_frame 으로 박자를 공급한다. 렌더러는 박자를
+    // 받아도 손상이 없으면 스킵하므로 blanket invalidate(강제 재페인트) 없이 페이싱이 선다.
+    wi.external_begin_frame_enabled = 1;
     // parent_view 는 절대 주지 않는다(null). windowless 에 부모 뷰를 주면 CEF GetWindowHandle 이
     // 그 뷰를 반환하고, do_close/was_hidden 등 window_handle 경로가 "창의 contentView" 를 제거/숨김
     // 처리해 메인 웹뷰가 창에서 분리된다(실측: 캡처 with_webview 가 detached 웹뷰를 만나 앱 사망).
@@ -1724,6 +1749,10 @@ wrap_render_handler! {
                 return;
             }
             crate::presenter::present(id, info);
+            // 손상-구동 자가지속 — 프레임이 실제로 나오는 동안(비디오·CSS 애니메이션 등 입력 없는
+            // 연속 콘텐츠) 자기 활동 창을 재장전해 begin-frame 박자를 유지한다. 정적이면 프레임이
+            // 안 나오므로 재장전도 없고, grace 만료와 함께 박자가 멈춘다(빈 틱 무한 루프 없음).
+            bump_id(id);
         }
         fn on_paint(
             &self,
