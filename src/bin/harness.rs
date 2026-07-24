@@ -209,6 +209,7 @@ mod run {
             assert_eq!(rc, 0, "engine init 실패");
 
             let url = if self.mode == "paint-cadence" { STATIC_PAGE } else { TEST_PAGE };
+            // windowed-cycle 은 windowed 생성(기본 경로) 그대로 — create 분기 변경 없음.
             let mut create = serde_json::json!({
                 "type": "create", "x": 10, "y": 10, "w": 700, "h": 440, "url": url
             });
@@ -244,6 +245,100 @@ mod run {
                 ));
                 return;
             };
+            // windowed-cycle 시나리오 — 앱의 뷰 활성화 시퀀스(hidden(true) → focus → hidden(false))
+            // 를 재현해 픽셀을 단언한다. RED 근거(실사고): 앱에서 windowed 탭이 "자기 포커스일
+            // 때만" 블랭크 — 숨김 중 포커스를 받은 Chromium 렌더 위젯이 unhide 후 재제시하지
+            // 않는다(blur 가 오면 재평가로 부활). 쿼리 GREEN 후 사이클을 돌리고 다시 픽셀을 잰다.
+            if self.mode == "windowed-cycle" {
+                let title = LAST_TITLE.lock().unwrap().clone();
+                let title_ok = title.starts_with("Q_OK:pong");
+                // 앱 타이밍 재현 — 각 op 사이에 펌프가 도는 실간격(300ms)을 둔다(즉발 연속은
+                // CEF 가 coalesce 해 미재현 — 실측). 사이클: hide → (pump) → focus → (pump) →
+                // show → 정착 후 픽셀 단언.
+                match self.cadence_phase {
+                    0 if title_ok => {
+                        let first = self.window.as_ref().and_then(windowed_pixels_ok);
+                        println!("[harness] 사이클 전 픽셀: {first:?}");
+                        if first != Some(true) {
+                            println!("[harness] FAIL (사이클 전부터 블랭크 — 전제 불성립)");
+                            std::process::exit(1);
+                        }
+                        send(&serde_json::json!({ "type": "hidden", "id": 1, "hidden": true }));
+                        self.cadence_phase = 1;
+                        self.cadence_mark = Instant::now();
+                    }
+                    1 if self.cadence_mark.elapsed() > Duration::from_millis(300) => {
+                        send(&serde_json::json!({ "type": "focus", "id": 1 }));
+                        // 앱의 클릭과 동형 — AppKit firstResponder 를 RWHVCocoa 로 넘긴다.
+                        // (CEF focus op 만으론 미재현 — 실측. 앱에선 클릭 hit-test 가 이걸 한다.)
+                        #[cfg(target_os = "macos")]
+                        if let Some(w) = self.window.as_ref() {
+                            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                            use objc2::msg_send;
+                            use objc2::runtime::AnyObject;
+                            if let Ok(h) = w.window_handle() {
+                                if let RawWindowHandle::AppKit(ak) = h.as_raw() {
+                                    unsafe {
+                                        let view = ak.ns_view.as_ptr() as *mut AnyObject;
+                                        let win: *mut AnyObject = msg_send![&*view, window];
+                                        if !win.is_null() {
+                                            fn find_rwhv(v: *mut objc2::runtime::AnyObject) -> Option<*mut objc2::runtime::AnyObject> {
+                                                unsafe {
+                                                    use objc2::msg_send;
+                                                    let cls: &objc2::runtime::AnyClass = msg_send![&*v, class];
+                                                    if cls.name().to_string_lossy().contains("RenderWidgetHostView") {
+                                                        return Some(v);
+                                                    }
+                                                    let subs: *mut objc2::runtime::AnyObject = msg_send![&*v, subviews];
+                                                    let n: usize = msg_send![&*subs, count];
+                                                    for i in 0..n {
+                                                        let c: *mut objc2::runtime::AnyObject = msg_send![&*subs, objectAtIndex: i];
+                                                        if let Some(f) = find_rwhv(c) {
+                                                            return Some(f);
+                                                        }
+                                                    }
+                                                    None
+                                                }
+                                            }
+                                            let content: *mut AnyObject = msg_send![&*win, contentView];
+                                            if let Some(rwhv) = find_rwhv(content) {
+                                                let _: bool = msg_send![&*win, makeFirstResponder: &*rwhv];
+                                                println!("[harness] RWHVCocoa firstResponder 부여");
+                                            } else {
+                                                println!("[harness] RWHV 미발견 — responder 단계 생략");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        self.cadence_phase = 2;
+                        self.cadence_mark = Instant::now();
+                    }
+                    2 if self.cadence_mark.elapsed() > Duration::from_millis(300) => {
+                        send(&serde_json::json!({ "type": "hidden", "id": 1, "hidden": false }));
+                        self.cadence_phase = 3;
+                        self.cadence_mark = Instant::now();
+                    }
+                    3 if self.cadence_mark.elapsed() > Duration::from_millis(1500) => {
+                        let after = self.window.as_ref().and_then(windowed_pixels_ok);
+                        println!("[harness] 사이클 후 픽셀: {after:?}");
+                        let pass = after == Some(true);
+                        println!("[harness] {}", if pass { "PASS" } else { "FAIL" });
+                        std::process::exit(if pass { 0 } else { 1 });
+                    }
+                    _ => {}
+                }
+                if t0.elapsed() > Duration::from_secs(25) {
+                    println!("[harness] FAIL (windowed-cycle 타임아웃 title={title:?})");
+                    std::process::exit(1);
+                }
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(100),
+                ));
+                return;
+            }
+
             // paint-cadence 시나리오 — 페인트 수를 프레임 스트림 파트 수로 직접 계수한다.
             // 판정 2축: ① 정적 페이지 구독 3초 = 1..=6 파트(첫 프레임 보장 + 강제 재페인트 폭풍
             // 부재), ② 활동 grace 만료 후 애니메이션 3초 ≥ 30 파트(호스트 박자 + 손상-구동
