@@ -46,6 +46,7 @@ pub(crate) fn enable(id: u32, on: bool) -> u16 {
         if let Ok(mut s) = ENABLED.lock() {
             s.insert(id);
         }
+        crate::engine::kick_paint(id); // 정적 페이지 첫 프레임 킥
     } else {
         if let Ok(mut s) = ENABLED.lock() {
             s.remove(&id);
@@ -171,6 +172,7 @@ fn accept_client(mut stream: TcpStream) {
     if let Ok(mut subs) = SUBS.lock() {
         subs.entry(id).or_default().push(stream);
     }
+    crate::engine::kick_paint(id); // 구독 직후 1프레임 보장(정적 페이지)
 }
 
 fn encode_and_fanout(f: Frame) {

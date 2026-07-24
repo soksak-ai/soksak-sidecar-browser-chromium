@@ -291,6 +291,12 @@ fn bump_active() {
     ACTIVE_UNTIL_MS.store(now_ms() + ACTIVE_GRACE_MS, Ordering::Relaxed);
     start_render_tick();
 }
+// 프레임 스트림 구독 킥(frame_stream) — 정적 페이지는 손상이 없어 구독 후 첫 프레임이
+// 영영 안 온다. 활동 창을 열어 invalidate 틱이 한 번 돌게 한다(변화 없으면 CEF 가 스킵).
+pub(crate) fn kick_paint(id: u32) {
+    bump_id(id);
+}
+
 // 서피스별 활동 — 이 id 만 invalidate 대상에 든다.
 fn bump_id(id: u32) {
     if let Ok(mut m) = ACTIVE_IDS.lock() {
